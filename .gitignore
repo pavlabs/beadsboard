@@ -1,0 +1,4 @@
+/beadsboard
+/dist/
+*.log
+.DS_Store
