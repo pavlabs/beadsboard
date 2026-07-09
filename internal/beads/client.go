@@ -82,6 +82,18 @@ func (c *Client) Load(ctx context.Context) (map[string]Issue, error) {
 	return byID, nil
 }
 
+// Update persists a single field change via `bd update <id> --<field> <value>`.
+// The value is passed as one argv element (no shell), so multi-line description
+// and notes need no escaping or temp file.
+func (c *Client) Update(ctx context.Context, id, field, value string) error {
+	cmd := exec.CommandContext(ctx, "bd", "update", id, "--"+field, value)
+	cmd.Dir = c.Dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("bd update: %w: %s", err, sanitize(strings.TrimSpace(string(out))))
+	}
+	return nil
+}
+
 // sanitize strips control bytes that could smuggle terminal escape sequences
 // (ANSI/OSC — e.g. clipboard writes or title rewrites) out of untrusted issue
 // text, while keeping newlines and tabs that legitimately shape descriptions.
