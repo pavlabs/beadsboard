@@ -9,6 +9,7 @@ type Issue struct {
 	Priority     int      `json:"priority"`
 	IssueType    string   `json:"issue_type"` // epic | task
 	Description  string   `json:"description"`
+	Notes        string   `json:"notes"`
 	Labels       []string `json:"labels"`
 	Dependencies []Dep    `json:"dependencies"`
 	UpdatedAt    string   `json:"updated_at"`

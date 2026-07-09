@@ -57,6 +57,7 @@ func (c *Client) Load(ctx context.Context) (map[string]Issue, error) {
 		}
 		is.Title = sanitize(is.Title)
 		is.Description = sanitize(is.Description)
+		is.Notes = sanitize(is.Notes)
 		for j, l := range is.Labels {
 			is.Labels[j] = sanitize(l)
 		}
