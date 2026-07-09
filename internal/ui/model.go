@@ -26,6 +26,10 @@ type model struct {
 
 	epicCursor int
 
+	focused    bool // right pane (fields + tasks) has focus
+	section    int  // which right-pane section is selected (sec* below)
+	taskCursor int  // selected task when the task-list section is focused
+
 	editing   bool // field picker is open, awaiting a field choice
 	editField int  // index into editFields
 
@@ -34,6 +38,17 @@ type model struct {
 
 	width, height int
 }
+
+// Right-pane sections the cursor cycles through with tab.
+const (
+	secTitle = iota
+	secStatus
+	secPriority
+	secDescription
+	secNotes
+	secTasks
+	sectionCount
+)
 
 // editFields are the bd edit targets the field picker cycles through with tab.
 var editFields = []string{"title", "description", "notes"}
@@ -187,6 +202,17 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !m.loading {
 			return m.startReload()
 		}
+		return m, nil
+	}
+	if m.focused {
+		return m.handleRightKey(msg)
+	}
+	return m.handleLeftKey(msg)
+}
+
+// handleLeftKey drives the epic list.
+func (m model) handleLeftKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
 	case "e":
 		if !m.loading && m.graph != nil && m.currentEpic() != "" {
 			m.editing = true
@@ -198,10 +224,41 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "down", "j":
 		m.moveEpic(1)
 		m.syncDetail()
-	case "pgup", "b":
-		m.detail.HalfPageUp()
-	case "pgdown", "f":
-		m.detail.HalfPageDown()
+	case "enter", "l", "right":
+		if m.currentEpic() != "" {
+			m.focused = true
+			m.section = secTitle
+			m.taskCursor = 0
+			m.syncDetail()
+		}
+	}
+	return m, nil
+}
+
+// handleRightKey drives the fields + task-list sections of the right pane.
+func (m model) handleRightKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "h", "left":
+		m.focused = false
+		m.syncDetail()
+	case "tab":
+		m.section = (m.section + 1) % sectionCount
+		m.syncDetail()
+	case "shift+tab":
+		m.section = (m.section - 1 + sectionCount) % sectionCount
+		m.syncDetail()
+	case "up", "k":
+		if m.section == secTasks {
+			m.moveTask(-1)
+		} else {
+			m.detail.ScrollUp(1)
+		}
+	case "down", "j":
+		if m.section == secTasks {
+			m.moveTask(1)
+		} else {
+			m.detail.ScrollDown(1)
+		}
 	}
 	return m, nil
 }
@@ -234,11 +291,20 @@ func (m *model) moveEpic(d int) {
 	m.epicCursor = min(max(m.epicCursor+d, 0), len(m.graph.Epics)-1)
 }
 
+func (m *model) moveTask(d int) {
+	n := len(m.currentEpicTasks())
+	if n == 0 {
+		return
+	}
+	m.taskCursor = min(max(m.taskCursor+d, 0), n-1)
+}
+
 func (m *model) clampCursors() {
 	if m.graph == nil {
 		return
 	}
 	m.epicCursor = min(max(m.epicCursor, 0), max(len(m.graph.Epics)-1, 0))
+	m.taskCursor = min(max(m.taskCursor, 0), max(len(m.currentEpicTasks())-1, 0))
 }
 
 // currentEpic is the epic the cursor is highlighting, or "".

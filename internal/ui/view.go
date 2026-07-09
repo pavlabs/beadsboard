@@ -18,13 +18,14 @@ func (m model) layout() (leftOuter, rightOuter, innerH int) {
 	return
 }
 
-// rightSplit divides the right pane's inner height into the fields region (top,
-// ~30%) and the task-list region (bottom). The two stacked boxes add 4 border
-// rows total versus the single left box's 2, so the usable content is innerH-2.
+// rightSplit divides the right pane's inner height. The epic metadata (top) gets
+// the majority so every field stays visible without scrolling; the task list
+// (bottom) takes ~30%. The two stacked boxes add 4 border rows total versus the
+// single left box's 2, so the usable content is innerH-2.
 func rightSplit(innerH int) (topContent, botContent int) {
 	usable := max(innerH-2, 2)
-	topContent = min(max(usable*3/10, 3), usable-1)
-	botContent = usable - topContent
+	botContent = min(max(usable*3/10, 4), max(usable-4, 1))
+	topContent = usable - botContent
 	return
 }
 
@@ -70,7 +71,10 @@ func (m model) footerLine() string {
 	if m.editing {
 		return m.editPrompt()
 	}
-	keys := "↑/↓ move · e edit · r refresh · q quit"
+	keys := "↑/↓ move · → open · e edit · r refresh · q quit"
+	if m.focused {
+		keys = "tab section · ↑/↓ scroll/move · esc back · r refresh · q quit"
+	}
 	return dimStyle.Render("  " + keys)
 }
 
@@ -125,26 +129,39 @@ func (m model) epicsContent(width, height int) string {
 	return b.String()
 }
 
-// taskListContent renders the current epic's tasks in the lower-right region.
+// taskListContent renders the current epic's tasks in the lower-right region,
+// highlighting the task cursor when the task-list section is focused.
 func (m model) taskListContent(width, height int) string {
 	tasks := m.currentEpicTasks()
+	active := m.focused && m.section == secTasks
+
 	var b strings.Builder
-	b.WriteString(dimStyle.Render(fmt.Sprintf("TASKS (%d)", len(tasks))))
+	hdr := fmt.Sprintf("TASKS (%d)", len(tasks))
+	if active {
+		b.WriteString(selectedStyle.Render(" " + hdr + " "))
+	} else {
+		b.WriteString(dimStyle.Render(hdr))
+	}
 	if len(tasks) == 0 {
 		fmt.Fprintf(&b, "\n%s", dimStyle.Render("no tasks"))
 		return b.String()
 	}
 	b.WriteString("\n\n")
 	rows := max(height-2, 1)
-	for i, id := range tasks {
-		if i >= rows {
-			fmt.Fprintf(&b, "%s", dimStyle.Render(fmt.Sprintf("… +%d more", len(tasks)-i)))
-			break
-		}
-		b.WriteString(m.renderRow(id, false, width))
-		if i < len(tasks)-1 && i < rows-1 {
+
+	start := 0
+	if active {
+		start = windowStart(len(tasks), m.taskCursor, rows)
+	}
+	end := min(start+rows, len(tasks))
+	for i := start; i < end; i++ {
+		b.WriteString(m.renderRow(tasks[i], active && i == m.taskCursor, width))
+		if i < end-1 {
 			b.WriteByte('\n')
 		}
+	}
+	if end < len(tasks) {
+		fmt.Fprintf(&b, "\n%s", dimStyle.Render(fmt.Sprintf("… +%d below", len(tasks)-end)))
 	}
 	return b.String()
 }
@@ -196,45 +213,83 @@ func (m model) renderRow(id string, selected bool, width int) string {
 	return line
 }
 
-// syncDetail refreshes the fields region with the highlighted epic's detail.
+// syncDetail refreshes the fields region for the highlighted epic and resets
+// its scroll — used when the epic changes or the window resizes.
 func (m *model) syncDetail() {
-	if m.graph == nil {
-		return
-	}
-	id := m.currentEpic()
-	if id == "" {
-		m.detail.SetContent("")
-		return
-	}
-	// The viewport clips rather than wraps, so wrap to its width first. lipgloss
-	// is ANSI-aware and won't miscount the escape bytes in the styled segments.
-	m.detail.SetContent(lipgloss.NewStyle().Width(m.detail.Width).Render(m.epicDetail(id)))
+	m.renderFields()
 	m.detail.GotoTop()
 }
 
-// detailHeader renders the title, id line, and status line shared by both
-// epic and task detail views.
-func detailHeader(b *strings.Builder, is beads.Issue, id, status string) {
-	fmt.Fprintf(b, "%s\n", titleStyle.Render(is.Title))
-	fmt.Fprintf(b, "%s\n\n", dimStyle.Render(fmt.Sprintf("%s · %s", shortID(id), id)))
-	fmt.Fprintf(b, "%s  %s  P%d\n", glyph(status), statusWord(status), is.Priority)
+// renderFields rebuilds the fields-region content, highlighting the focused
+// section. Title stays pinned at the top — moving between sections only moves
+// the highlight, never scrolls the metadata out of view.
+func (m *model) renderFields() {
+	id := m.currentEpic()
+	if m.graph == nil || id == "" {
+		m.detail.SetContent("")
+		return
+	}
+	m.detail.SetContent(m.epicFields(id))
 }
 
-func (m model) epicDetail(id string) string {
+// epicFields lays out the epic's navigable fields (title/status/priority, then
+// read-only context, then the description and notes blocks), highlighting the
+// focused section.
+func (m model) epicFields(id string) string {
 	is := m.graph.Issues[id]
-	done, total := m.graph.EpicProgress(id)
+	st := m.graph.EpicStatus[id]
+	width := max(m.detail.Width, 1)
 
 	var b strings.Builder
-	detailHeader(&b, is, id, m.graph.EpicStatus[id])
-	fmt.Fprintf(&b, "%s\n", labelStyle.Render(fmt.Sprintf("progress: %d/%d tasks done", done, total)))
+	put := func(s string) {
+		b.WriteString(s)
+		b.WriteByte('\n')
+	}
+	ctx := func(label, val string) {
+		put(labelStyle.Render(fmt.Sprintf("%-11s ", label)) + val)
+	}
+	short := func(sec int, label, plain, styled string) {
+		if m.focused && m.section == sec {
+			put(selectedStyle.Render(truncate(fmt.Sprintf("%-11s %s", label, plain), width)))
+		} else {
+			put(labelStyle.Render(fmt.Sprintf("%-11s ", label)) + styled)
+		}
+	}
+	block := func(sec int, label, body string) {
+		put("")
+		if m.focused && m.section == sec {
+			put(selectedStyle.Render(" " + label + " "))
+		} else {
+			put(labelStyle.Render(label))
+		}
+		if strings.TrimSpace(body) == "" {
+			put(dimStyle.Render("  (none)"))
+			return
+		}
+		for _, l := range strings.Split(lipgloss.NewStyle().Width(max(width-2, 1)).Render(body), "\n") {
+			put("  " + l)
+		}
+	}
+
+	short(secTitle, "title", is.Title, titleStyle.Render(is.Title))
+	short(secStatus, "status", statusOf(st).word, glyph(st)+" "+statusWord(st))
+	short(secPriority, "priority", fmt.Sprintf("P%d", is.Priority), fmt.Sprintf("P%d", is.Priority))
+
+	done, total := m.graph.EpicProgress(id)
+	ctx("progress", fmt.Sprintf("%d/%d done", done, total))
 	if needs := m.graph.Prereqs[id]; len(needs) > 0 {
-		fmt.Fprintf(&b, "%s\n", labelStyle.Render("needs: "+joinShort(needs, 99)))
+		ctx("needs", joinShort(needs, 99))
 	}
 	if unl := m.graph.Unlocks[id]; len(unl) > 0 {
-		fmt.Fprintf(&b, "%s\n", labelStyle.Render("unlocks: "+joinShort(unl, 99)))
+		ctx("unlocks", joinShort(unl, 99))
 	}
-	writeLabels(&b, is.Labels)
-	writeDescription(&b, is.Description)
+	if len(is.Labels) > 0 {
+		ctx("labels", strings.Join(is.Labels, ", "))
+	}
+
+	block(secDescription, "description", is.Description)
+	block(secNotes, "notes", is.Notes)
+
 	return b.String()
 }
 
@@ -252,21 +307,6 @@ func (m model) blockerRefs(task string) []string {
 		}
 	}
 	return out
-}
-
-func writeLabels(b *strings.Builder, labels []string) {
-	if len(labels) > 0 {
-		fmt.Fprintf(b, "%s\n", labelStyle.Render("labels: "+strings.Join(labels, ", ")))
-	}
-}
-
-func writeDescription(b *strings.Builder, desc string) {
-	fmt.Fprintf(b, "%s\n", dimStyle.Render(strings.Repeat("─", 8)))
-	if strings.TrimSpace(desc) == "" {
-		b.WriteString(dimStyle.Render("(no description)"))
-		return
-	}
-	b.WriteString(desc)
 }
 
 // joinShort abbreviates each id then joins up to limit of them.

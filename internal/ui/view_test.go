@@ -121,6 +121,43 @@ func TestDescriptionWraps(t *testing.T) {
 	}
 }
 
+// Enter focuses the right pane; Tab cycles the sections and wraps; Esc returns.
+func TestFocusModelSections(t *testing.T) {
+	m := testModel()
+	require.False(t, m.focused)
+
+	next, _ := m.handleKey(keyMsg("enter"))
+	m = next.(model)
+	require.True(t, m.focused)
+	require.Equal(t, secTitle, m.section)
+
+	for _, want := range []int{secStatus, secPriority, secDescription, secNotes, secTasks, secTitle} {
+		next, _ = m.handleKey(keyMsg("tab"))
+		m = next.(model)
+		require.Equal(t, want, m.section)
+	}
+
+	next, _ = m.handleKey(keyMsg("esc"))
+	m = next.(model)
+	require.False(t, m.focused)
+}
+
+// When the task-list section is focused, up/down move the task cursor.
+func TestTaskSectionCursor(t *testing.T) {
+	m := testModel() // epic "a" has tasks a.1, a.2
+	m.focused = true
+	m.section = secTasks
+	require.Equal(t, 0, m.taskCursor)
+
+	next, _ := m.handleKey(keyMsg("down"))
+	m = next.(model)
+	require.Equal(t, 1, m.taskCursor)
+
+	next, _ = m.handleKey(keyMsg("down"))
+	m = next.(model)
+	require.Equal(t, 1, m.taskCursor, "clamps at the last task")
+}
+
 // Esc cancels the picker without launching an editor.
 func TestEditPickerCancel(t *testing.T) {
 	m := testModel()
