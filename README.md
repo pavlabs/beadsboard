@@ -6,7 +6,27 @@ you move the cursor.
 
 ```
 beadsboard [--source DIR]      # --source defaults to the current directory; must contain a .beads/
+beadsboard --version           # print the version and exit
 ```
+
+## Install
+
+With Go installed:
+
+```bash
+go install github.com/pavlabs/beadsboard@latest
+```
+
+Or download a prebuilt binary for your platform (darwin/linux, amd64/arm64) from the
+[GitHub releases](https://github.com/pavlabs/beadsboard/releases), e.g.:
+
+```bash
+tar -xzf beadsboard_<version>_darwin_arm64.tar.gz
+install -m 0755 beadsboard /usr/local/bin/
+```
+
+Releases are cut by tagging: `git tag vX.Y.Z && git push --tags` triggers the
+GoReleaser workflow, which builds every platform and publishes the archives.
 
 ## What it shows
 
