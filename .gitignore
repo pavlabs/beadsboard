@@ -2,3 +2,14 @@
 /dist/
 *.log
 .DS_Store
+
+# local scratch notes, not committed
+/notes/
+
+# beads issue tracker — kept local, not committed
+/.beads/
+/.agents/
+/.codex/
+/.claude/
+/AGENTS.md
+/CLAUDE.md
