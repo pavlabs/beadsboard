@@ -5,15 +5,26 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/pavlabs/beadsboard/internal/ui"
 )
 
+// version is stamped via -ldflags at release build time; otherwise it falls
+// back to the module build info so `go install ...@vX` reports the right tag.
+var version = ""
+
 func main() {
 	source := flag.String("source", ".", "beads repository directory to browse (must contain .beads/)")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("beadsboard", resolveVersion())
+		return
+	}
 
 	abs, err := filepath.Abs(*source)
 	if err != nil {
@@ -30,4 +41,14 @@ func main() {
 		fmt.Fprintln(os.Stderr, "beadsboard:", err)
 		os.Exit(1)
 	}
+}
+
+func resolveVersion() string {
+	if version != "" {
+		return version
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" {
+		return bi.Main.Version
+	}
+	return "dev"
 }
