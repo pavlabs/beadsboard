@@ -1,10 +1,12 @@
 package ui
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/stretchr/testify/require"
 
 	"github.com/pavlabs/beadsboard/internal/beads"
@@ -50,15 +52,15 @@ func TestRenderEpicsLevel(t *testing.T) {
 	require.Contains(t, out, "needs") // Beta needs Alpha
 }
 
-func TestDrillIntoTasksAndDetail(t *testing.T) {
+// The current epic's tasks render in the right pane's task-list region without
+// any drilling; the epic's fields render above them.
+func TestTasksShownForEpic(t *testing.T) {
 	m := testModel()
-	next, _ := m.handleKey(keyMsg("enter"))
-	m = next.(model)
-	require.Equal(t, focusTasks, m.level)
-
 	out := m.View()
-	require.Contains(t, out, "build it")   // task title in the list
-	require.Contains(t, out, "Alpha epic") // breadcrumb header
+	require.Contains(t, out, "Alpha epic") // epic fields region
+	require.Contains(t, out, "build it")   // task a.2 in the task list
+	require.Contains(t, out, "design")     // task a.1 in the task list
+	require.Contains(t, out, "TASKS")      // task-list header
 }
 
 func TestDetailUpdatesOnHover(t *testing.T) {
@@ -100,7 +102,23 @@ func TestEditFieldPicker(t *testing.T) {
 	m = next.(model)
 	require.False(t, m.editing)
 	require.NotNil(t, cmd, "enter launches the editor")
-	require.Equal(t, focusEpics, m.level, "picker doesn't disturb navigation")
+	require.Equal(t, 0, m.epicCursor, "picker doesn't disturb navigation")
+}
+
+// A long description wraps to the detail pane width instead of being clipped to
+// a single line by the viewport.
+func TestDescriptionWraps(t *testing.T) {
+	m := testModel()
+	id := m.currentEpic()
+	is := m.graph.Issues[id]
+	is.Description = strings.Repeat("word ", 200) // ~1000 chars, all breakable
+	m.graph.Issues[id] = is
+	m.syncDetail()
+
+	require.Greater(t, m.detail.TotalLineCount(), 8, "long description spans many wrapped lines")
+	for _, line := range strings.Split(m.detail.View(), "\n") {
+		require.LessOrEqual(t, lipgloss.Width(line), m.detail.Width, "no line exceeds pane width")
+	}
 }
 
 // Esc cancels the picker without launching an editor.

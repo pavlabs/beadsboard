@@ -18,10 +18,21 @@ func (m model) layout() (leftOuter, rightOuter, innerH int) {
 	return
 }
 
+// rightSplit divides the right pane's inner height into the fields region (top,
+// ~30%) and the task-list region (bottom). The two stacked boxes add 4 border
+// rows total versus the single left box's 2, so the usable content is innerH-2.
+func rightSplit(innerH int) (topContent, botContent int) {
+	usable := max(innerH-2, 2)
+	topContent = min(max(usable*3/10, 3), usable-1)
+	botContent = usable - topContent
+	return
+}
+
 func (m *model) resizeDetail() {
 	_, rightOuter, innerH := m.layout()
+	topContent, _ := rightSplit(innerH)
 	m.detail.Width = max(rightOuter-4, 1) // border + padding
-	m.detail.Height = innerH
+	m.detail.Height = topContent
 }
 
 func (m model) View() string {
@@ -59,7 +70,7 @@ func (m model) footerLine() string {
 	if m.editing {
 		return m.editPrompt()
 	}
-	keys := "↑/↓ move · → open · ← back · e edit · r refresh · q quit"
+	keys := "↑/↓ move · e edit · r refresh · q quit"
 	return dimStyle.Render("  " + keys)
 }
 
@@ -74,46 +85,64 @@ func (m model) editPrompt() string {
 			fields[i] = dimStyle.Render(f)
 		}
 	}
-	label := labelStyle.Render("edit " + shortID(m.currentID()) + ": ")
+	label := labelStyle.Render("edit " + shortID(m.currentEpic()) + ": ")
 	hint := dimStyle.Render("  · tab switch · enter open · esc cancel")
 	return "  " + label + strings.Join(fields, " ") + hint
 }
 
 func (m model) panes() string {
-	leftOuter, _, innerH := m.layout()
+	leftOuter, rightOuter, innerH := m.layout()
+	topContent, botContent := rightSplit(innerH)
+	rightInner := max(rightOuter-4, 1)
 
-	left := boxStyle.Width(leftOuter - 2).Height(innerH).Render(m.listContent(leftOuter-4, innerH))
-	right := boxStyle.Width(m.detail.Width + 2).Height(innerH).Render(m.detail.View())
+	left := boxStyle.Width(leftOuter - 2).Height(innerH).Render(m.epicsContent(leftOuter-4, innerH))
+	fields := boxStyle.Width(rightOuter - 2).Height(topContent).Render(m.detail.View())
+	tasks := boxStyle.Width(rightOuter - 2).Height(botContent).Render(m.taskListContent(rightInner, botContent))
+	right := lipgloss.JoinVertical(lipgloss.Left, fields, tasks)
 
 	return lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right)
 }
 
-// listContent renders the epic or task list (per level) with windowed scrolling.
-func (m model) listContent(width, height int) string {
-	items := m.currentItems()
-	if len(items) == 0 {
-		return dimStyle.Render("no issues")
-	}
-
-	var head string
-	if m.level == focusTasks {
-		epic := m.graph.Epics[m.epicCursor]
-		head = titleStyle.Render(truncate(m.graph.Issues[epic].Title, width))
-	} else {
-		head = dimStyle.Render(fmt.Sprintf("EPICS (%d)", len(items)))
+// epicsContent renders the epic list (left pane) with windowed scrolling.
+func (m model) epicsContent(width, height int) string {
+	epics := m.graph.Epics
+	if len(epics) == 0 {
+		return dimStyle.Render("no epics")
 	}
 	rows := max(height-2, 1) // header + spacer
 
-	start := windowStart(len(items), m.cursor(), rows)
-	end := min(start+rows, len(items))
+	start := windowStart(len(epics), m.epicCursor, rows)
+	end := min(start+rows, len(epics))
 
 	var b strings.Builder
-	b.WriteString(head)
-	b.WriteByte('\n')
-	b.WriteByte('\n')
+	fmt.Fprintf(&b, "%s\n\n", dimStyle.Render(fmt.Sprintf("EPICS (%d)", len(epics))))
 	for i := start; i < end; i++ {
-		b.WriteString(m.renderRow(items[i], i == m.cursor(), width))
+		b.WriteString(m.renderRow(epics[i], i == m.epicCursor, width))
 		if i < end-1 {
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+// taskListContent renders the current epic's tasks in the lower-right region.
+func (m model) taskListContent(width, height int) string {
+	tasks := m.currentEpicTasks()
+	var b strings.Builder
+	b.WriteString(dimStyle.Render(fmt.Sprintf("TASKS (%d)", len(tasks))))
+	if len(tasks) == 0 {
+		fmt.Fprintf(&b, "\n%s", dimStyle.Render("no tasks"))
+		return b.String()
+	}
+	b.WriteString("\n\n")
+	rows := max(height-2, 1)
+	for i, id := range tasks {
+		if i >= rows {
+			fmt.Fprintf(&b, "%s", dimStyle.Render(fmt.Sprintf("… +%d more", len(tasks)-i)))
+			break
+		}
+		b.WriteString(m.renderRow(id, false, width))
+		if i < len(tasks)-1 && i < rows-1 {
 			b.WriteByte('\n')
 		}
 	}
@@ -167,22 +196,19 @@ func (m model) renderRow(id string, selected bool, width int) string {
 	return line
 }
 
-// syncDetail refreshes the detail pane for the currently highlighted item.
+// syncDetail refreshes the fields region with the highlighted epic's detail.
 func (m *model) syncDetail() {
 	if m.graph == nil {
 		return
 	}
-	id := m.currentID()
+	id := m.currentEpic()
 	if id == "" {
 		m.detail.SetContent("")
 		return
 	}
-	is := m.graph.Issues[id]
-	if is.IsEpic() {
-		m.detail.SetContent(m.epicDetail(id))
-	} else {
-		m.detail.SetContent(m.taskDetail(id))
-	}
+	// The viewport clips rather than wraps, so wrap to its width first. lipgloss
+	// is ANSI-aware and won't miscount the escape bytes in the styled segments.
+	m.detail.SetContent(lipgloss.NewStyle().Width(m.detail.Width).Render(m.epicDetail(id)))
 	m.detail.GotoTop()
 }
 
@@ -206,19 +232,6 @@ func (m model) epicDetail(id string) string {
 	}
 	if unl := m.graph.Unlocks[id]; len(unl) > 0 {
 		fmt.Fprintf(&b, "%s\n", labelStyle.Render("unlocks: "+joinShort(unl, 99)))
-	}
-	writeLabels(&b, is.Labels)
-	writeDescription(&b, is.Description)
-	return b.String()
-}
-
-func (m model) taskDetail(id string) string {
-	is := m.graph.Issues[id]
-
-	var b strings.Builder
-	detailHeader(&b, is, id, m.graph.TaskStatus[id])
-	if refs := m.blockerRefs(id); len(refs) > 0 {
-		fmt.Fprintf(&b, "%s\n", labelStyle.Render("blocked by: "+strings.Join(refs, ", ")))
 	}
 	writeLabels(&b, is.Labels)
 	writeDescription(&b, is.Description)

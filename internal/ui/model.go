@@ -15,13 +15,6 @@ import (
 
 const refreshInterval = time.Second
 
-type focus int
-
-const (
-	focusEpics focus = iota
-	focusTasks
-)
-
 type model struct {
 	client *beads.Client
 	graph  *beads.Graph
@@ -29,11 +22,9 @@ type model struct {
 
 	loading bool
 	spinner spinner.Model
-	detail  viewport.Model
+	detail  viewport.Model // epic fields region (top-right)
 
-	level      focus
 	epicCursor int
-	taskCursor int
 
 	editing   bool // field picker is open, awaiting a field choice
 	editField int  // index into editFields
@@ -197,27 +188,16 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.startReload()
 		}
 	case "e":
-		if !m.loading && m.graph != nil && m.currentID() != "" {
+		if !m.loading && m.graph != nil && m.currentEpic() != "" {
 			m.editing = true
 			m.editField = fieldDescription
 		}
 	case "up", "k":
-		m.moveCursor(-1)
+		m.moveEpic(-1)
 		m.syncDetail()
 	case "down", "j":
-		m.moveCursor(1)
+		m.moveEpic(1)
 		m.syncDetail()
-	case "enter", "l", "right":
-		if m.level == focusEpics && len(m.currentEpicTasks()) > 0 {
-			m.level = focusTasks
-			m.taskCursor = 0
-			m.syncDetail()
-		}
-	case "esc", "h", "left":
-		if m.level == focusTasks {
-			m.level = focusEpics
-			m.syncDetail()
-		}
 	case "pgup", "b":
 		m.detail.HalfPageUp()
 	case "pgdown", "f":
@@ -240,76 +220,40 @@ func (m model) handleEditKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.editField = (m.editField - 1 + len(editFields)) % len(editFields)
 	case "enter":
 		m.editing = false
-		if id := m.currentID(); id != "" {
+		if id := m.currentEpic(); id != "" {
 			return m, m.editCmd(id, editFields[m.editField])
 		}
 	}
 	return m, nil
 }
 
-func (m *model) moveCursor(d int) {
-	n := len(m.currentItems())
-	if n == 0 {
+func (m *model) moveEpic(d int) {
+	if m.graph == nil || len(m.graph.Epics) == 0 {
 		return
 	}
-	m.setCursor(min(max(m.cursor()+d, 0), n-1))
+	m.epicCursor = min(max(m.epicCursor+d, 0), len(m.graph.Epics)-1)
 }
 
 func (m *model) clampCursors() {
 	if m.graph == nil {
 		return
 	}
-	if m.epicCursor >= len(m.graph.Epics) {
-		m.epicCursor = max(0, len(m.graph.Epics)-1)
-	}
-	tasks := m.currentEpicTasks()
-	if m.taskCursor >= len(tasks) {
-		m.taskCursor = max(0, len(tasks)-1)
-	}
-	if m.level == focusTasks && len(tasks) == 0 {
-		m.level = focusEpics
-	}
+	m.epicCursor = min(max(m.epicCursor, 0), max(len(m.graph.Epics)-1, 0))
 }
 
-// currentItems returns the id list the cursor navigates at the current level.
-func (m model) currentItems() []string {
-	if m.graph == nil {
-		return nil
-	}
-	if m.level == focusTasks {
-		return m.currentEpicTasks()
-	}
-	return m.graph.Epics
-}
-
-func (m model) currentEpicTasks() []string {
-	if m.graph == nil || m.epicCursor >= len(m.graph.Epics) {
-		return nil
-	}
-	return m.graph.Tasks[m.graph.Epics[m.epicCursor]]
-}
-
-func (m model) cursor() int {
-	if m.level == focusTasks {
-		return m.taskCursor
-	}
-	return m.epicCursor
-}
-
-func (m *model) setCursor(c int) {
-	if m.level == focusTasks {
-		m.taskCursor = c
-		return
-	}
-	m.epicCursor = c
-}
-
-// currentID is the id the cursor is highlighting, or "".
-func (m model) currentID() string {
-	items := m.currentItems()
-	c := m.cursor()
-	if c < 0 || c >= len(items) {
+// currentEpic is the epic the cursor is highlighting, or "".
+func (m model) currentEpic() string {
+	if m.graph == nil || m.epicCursor < 0 || m.epicCursor >= len(m.graph.Epics) {
 		return ""
 	}
-	return items[c]
+	return m.graph.Epics[m.epicCursor]
+}
+
+// currentEpicTasks are the tasks of the highlighted epic, in topo order.
+func (m model) currentEpicTasks() []string {
+	e := m.currentEpic()
+	if e == "" {
+		return nil
+	}
+	return m.graph.Tasks[e]
 }
