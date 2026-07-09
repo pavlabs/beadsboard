@@ -24,6 +24,10 @@ func keyMsg(s string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyEsc}
 	case "tab":
 		return tea.KeyMsg{Type: tea.KeyTab}
+	case "right":
+		return tea.KeyMsg{Type: tea.KeyRight}
+	case "left":
+		return tea.KeyMsg{Type: tea.KeyLeft}
 	default:
 		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
 	}
@@ -38,6 +42,7 @@ func testModel() model {
 		"b.1": {ID: "b.1", Title: "ship it", IssueType: "task", Status: "open", Dependencies: []beads.Dep{{DependsOnID: "b", Type: "parent-child"}, {DependsOnID: "a.2", Type: "blocks"}}},
 	}
 	m := model{client: beads.NewClient("testdir"), graph: beads.BuildGraph(issues), detail: viewport.New(0, 0)}
+	m.input, m.area = newInputs()
 	m.width, m.height = 120, 30
 	m.resizeDetail()
 	m.syncDetail()
@@ -78,31 +83,54 @@ func TestCrossEpicBlockerQualified(t *testing.T) {
 	require.Equal(t, []string{"a#2"}, m.blockerRefs("b.1"))
 }
 
-// Pressing 'e' opens the modal field picker (default: description) without
-// launching anything; tab cycles description→notes→title; enter launches the
-// editor on the chosen field and closes the picker.
-func TestEditFieldPicker(t *testing.T) {
+// e on the title section opens an inline text editor primed with the title; esc
+// cancels without persisting.
+func TestInlineEditTitle(t *testing.T) {
 	m := testModel()
+	m.focused = true
+	m.section = secTitle
 
-	next, cmd := m.handleKey(keyMsg("e"))
+	next, _ := m.handleKey(keyMsg("e"))
 	m = next.(model)
 	require.True(t, m.editing)
-	require.Nil(t, cmd, "opening the picker launches nothing yet")
-	require.Equal(t, fieldDescription, m.editField)
-	require.Contains(t, m.View(), "description")
+	require.Equal(t, secTitle, m.editSec)
+	require.Equal(t, "Alpha epic", m.input.Value())
 
-	next, _ = m.handleKey(keyMsg("tab"))
-	m = next.(model)
-	require.Equal(t, fieldNotes, m.editField)
-	next, _ = m.handleKey(keyMsg("tab"))
-	m = next.(model)
-	require.Equal(t, fieldTitle, m.editField, "tab wraps back to the first field")
-
-	next, cmd = m.handleKey(keyMsg("enter"))
+	next, _ = m.handleKey(keyMsg("esc"))
 	m = next.(model)
 	require.False(t, m.editing)
-	require.NotNil(t, cmd, "enter launches the editor")
-	require.Equal(t, 0, m.epicCursor, "picker doesn't disturb navigation")
+}
+
+// e on the status section cycles the valid statuses with the arrows.
+func TestInlineEditStatusCycle(t *testing.T) {
+	m := testModel()
+	m.focused = true
+	m.section = secStatus
+
+	next, _ := m.handleKey(keyMsg("e"))
+	m = next.(model)
+	require.True(t, m.editing)
+	require.Equal(t, 0, m.choice, "epic 'a' is open → index 0")
+
+	next, _ = m.handleKey(keyMsg("right"))
+	m = next.(model)
+	require.Equal(t, "in_progress", editStatuses[m.choice])
+}
+
+// Enter commits an inline edit: it closes the editor and issues a bd update.
+func TestInlineEditCommit(t *testing.T) {
+	m := testModel()
+	m.focused = true
+	m.section = secPriority
+
+	next, _ := m.handleKey(keyMsg("e"))
+	m = next.(model)
+	require.True(t, m.editing)
+
+	next, cmd := m.handleKey(keyMsg("enter"))
+	m = next.(model)
+	require.False(t, m.editing, "enter commits and closes the editor")
+	require.NotNil(t, cmd, "commit issues a bd update command")
 }
 
 // A long description wraps to the detail pane width instead of being clipped to
@@ -156,15 +184,4 @@ func TestTaskSectionCursor(t *testing.T) {
 	next, _ = m.handleKey(keyMsg("down"))
 	m = next.(model)
 	require.Equal(t, 1, m.taskCursor, "clamps at the last task")
-}
-
-// Esc cancels the picker without launching an editor.
-func TestEditPickerCancel(t *testing.T) {
-	m := testModel()
-	next, _ := m.handleKey(keyMsg("e"))
-	m = next.(model)
-	next, cmd := m.handleKey(keyMsg("esc"))
-	m = next.(model)
-	require.False(t, m.editing)
-	require.Nil(t, cmd)
 }

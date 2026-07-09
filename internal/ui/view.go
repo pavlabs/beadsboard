@@ -34,6 +34,9 @@ func (m *model) resizeDetail() {
 	topContent, _ := rightSplit(innerH)
 	m.detail.Width = max(rightOuter-4, 1) // border + padding
 	m.detail.Height = topContent
+	m.input.Width = max(m.detail.Width-14, 8)
+	m.area.SetWidth(max(m.detail.Width, 8))
+	m.area.SetHeight(max(topContent-4, 3))
 }
 
 func (m model) View() string {
@@ -68,30 +71,23 @@ func (m model) headerLine() string {
 }
 
 func (m model) footerLine() string {
-	if m.editing {
-		return m.editPrompt()
-	}
-	keys := "↑/↓ move · → open · e edit · r refresh · q quit"
-	if m.focused {
-		keys = "tab section · ↑/↓ scroll/move · esc back · r refresh · q quit"
+	var keys string
+	switch {
+	case m.editing:
+		switch m.editSec {
+		case secStatus, secPriority:
+			keys = "←/→ change · enter save · esc cancel"
+		case secTitle:
+			keys = "enter save · esc cancel"
+		default:
+			keys = "ctrl+s save · esc cancel · enter = newline"
+		}
+	case m.focused:
+		keys = "tab section · e edit · ↑/↓ scroll/move · esc back · q quit"
+	default:
+		keys = "↑/↓ move · → open · r refresh · q quit"
 	}
 	return dimStyle.Render("  " + keys)
-}
-
-// editPrompt renders the modal field picker: each editable field, the current
-// one highlighted, plus the controls.
-func (m model) editPrompt() string {
-	fields := make([]string, len(editFields))
-	for i, f := range editFields {
-		if i == m.editField {
-			fields[i] = selectedStyle.Render(" " + f + " ")
-		} else {
-			fields[i] = dimStyle.Render(f)
-		}
-	}
-	label := labelStyle.Render("edit " + shortID(m.currentEpic()) + ": ")
-	hint := dimStyle.Render("  · tab switch · enter open · esc cancel")
-	return "  " + label + strings.Join(fields, " ") + hint
 }
 
 func (m model) panes() string {
@@ -249,18 +245,28 @@ func (m model) epicFields(id string) string {
 		put(labelStyle.Render(fmt.Sprintf("%-11s ", label)) + val)
 	}
 	short := func(sec int, label, plain, styled string) {
-		if m.focused && m.section == sec {
+		switch {
+		case m.editing && m.editSec == sec:
+			put(labelStyle.Render(fmt.Sprintf("%-11s ", label)) + m.editShortView(sec))
+		case m.focused && m.section == sec:
 			put(selectedStyle.Render(truncate(fmt.Sprintf("%-11s %s", label, plain), width)))
-		} else {
+		default:
 			put(labelStyle.Render(fmt.Sprintf("%-11s ", label)) + styled)
 		}
 	}
 	block := func(sec int, label, body string) {
 		put("")
-		if m.focused && m.section == sec {
+		editing := m.editing && m.editSec == sec
+		if editing || (m.focused && m.section == sec) {
 			put(selectedStyle.Render(" " + label + " "))
 		} else {
 			put(labelStyle.Render(label))
+		}
+		if editing {
+			for _, l := range strings.Split(m.area.View(), "\n") {
+				put(l)
+			}
+			return
 		}
 		if strings.TrimSpace(body) == "" {
 			put(dimStyle.Render("  (none)"))
@@ -291,6 +297,20 @@ func (m model) epicFields(id string) string {
 	block(secNotes, "notes", is.Notes)
 
 	return b.String()
+}
+
+// editShortView renders the active editor for a short field: the title text box
+// or the status/priority cycle chooser.
+func (m model) editShortView(sec int) string {
+	switch sec {
+	case secTitle:
+		return m.input.View()
+	case secStatus:
+		return selectedStyle.Render(" ‹ " + editStatuses[m.choice] + " › ")
+	case secPriority:
+		return selectedStyle.Render(fmt.Sprintf(" ‹ P%d › ", m.choice))
+	}
+	return ""
 }
 
 // blockerRefs renders a task's open blockers, qualifying any that live in a

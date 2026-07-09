@@ -2,11 +2,12 @@ package ui
 
 import (
 	"context"
-	"fmt"
-	"os/exec"
+	"strconv"
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -30,8 +31,11 @@ type model struct {
 	section    int  // which right-pane section is selected (sec* below)
 	taskCursor int  // selected task when the task-list section is focused
 
-	editing   bool // field picker is open, awaiting a field choice
-	editField int  // index into editFields
+	editing bool            // inline editing the focused field
+	editSec int             // section being edited
+	input   textinput.Model // title editor
+	area    textarea.Model  // description/notes editor
+	choice  int             // status index / priority value while cycling
 
 	fp    uint64
 	hasFP bool
@@ -50,14 +54,8 @@ const (
 	sectionCount
 )
 
-// editFields are the bd edit targets the field picker cycles through with tab.
-var editFields = []string{"title", "description", "notes"}
-
-const (
-	fieldTitle = iota
-	fieldDescription
-	fieldNotes
-)
+// editStatuses are the statuses the status field cycles through when editing.
+var editStatuses = []string{"open", "in_progress", "blocked", "closed"}
 
 // Messages.
 type (
@@ -71,18 +69,31 @@ type (
 		fp  uint64
 		err error
 	}
-	editFinishedMsg struct{ err error }
+	editSavedMsg struct{ err error }
 )
+
+// newInputs builds the title and description/notes editors with their shared
+// configuration.
+func newInputs() (textinput.Model, textarea.Model) {
+	ta := textarea.New()
+	ta.ShowLineNumbers = false
+	ta.Prompt = ""
+	return textinput.New(), ta
+}
 
 // New builds the root model for the given target directory.
 func New(dir string) model {
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
+	ti, ta := newInputs()
+
 	return model{
 		client:  beads.NewClient(dir),
 		loading: true,
 		spinner: sp,
 		detail:  viewport.New(0, 0),
+		input:   ti,
+		area:    ta,
 	}
 }
 
@@ -127,12 +138,14 @@ func (m model) startReload() (tea.Model, tea.Cmd) {
 	return m, tea.Batch(m.spinner.Tick, m.hydrateCmd())
 }
 
-// editCmd hands the terminal to `bd edit <id> --<field>` (opens $EDITOR on the
-// chosen field); the board reloads once the editor returns.
-func (m model) editCmd(id, field string) tea.Cmd {
-	c := exec.Command("bd", "edit", id, "--"+field)
-	c.Dir = m.client.Dir
-	return tea.ExecProcess(c, func(err error) tea.Msg { return editFinishedMsg{err: err} })
+// updateCmd persists a field edit via `bd update` off the UI goroutine.
+func (m model) updateCmd(id, field, value string) tea.Cmd {
+	client := m.client
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		return editSavedMsg{err: client.Update(ctx, id, field, value)}
+	}
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -173,12 +186,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case editFinishedMsg:
+	case editSavedMsg:
 		if msg.err != nil {
-			m.err = fmt.Errorf("bd edit: %w", msg.err)
+			m.loading = false
+			m.err = msg.err
 			return m, nil
 		}
-		return m.startReload()
+		return m.startReload() // reflect the saved change immediately
 
 	case spinner.TickMsg:
 		if !m.loading {
@@ -213,11 +227,6 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // handleLeftKey drives the epic list.
 func (m model) handleLeftKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "e":
-		if !m.loading && m.graph != nil && m.currentEpic() != "" {
-			m.editing = true
-			m.editField = fieldDescription
-		}
 	case "up", "k":
 		m.moveEpic(-1)
 		m.syncDetail()
@@ -247,6 +256,10 @@ func (m model) handleRightKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "shift+tab":
 		m.section = (m.section - 1 + sectionCount) % sectionCount
 		m.syncDetail()
+	case "e":
+		if !m.loading && m.section != secTasks {
+			m.beginEdit()
+		}
 	case "up", "k":
 		if m.section == secTasks {
 			m.moveTask(-1)
@@ -263,25 +276,144 @@ func (m model) handleRightKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// handleEditKey drives the modal field picker: tab cycles the target field,
-// enter launches the editor on it, esc cancels.
+// beginEdit opens the inline editor for the focused field, primed with its
+// current value.
+func (m *model) beginEdit() {
+	id := m.currentEpic()
+	if id == "" {
+		return
+	}
+	is := m.graph.Issues[id]
+	m.editing = true
+	m.editSec = m.section
+	switch m.section {
+	case secTitle:
+		m.input.SetValue(is.Title)
+		m.input.CursorEnd()
+		m.input.Focus()
+	case secStatus:
+		m.choice = max(indexOf(editStatuses, is.Status), 0)
+	case secPriority:
+		m.choice = min(max(is.Priority, 0), 4)
+	case secDescription:
+		m.area.SetValue(is.Description)
+		m.area.Focus()
+	case secNotes:
+		m.area.SetValue(is.Notes)
+		m.area.Focus()
+	}
+	m.renderFields()
+}
+
+// handleEditKey routes keys to the widget backing the field being edited.
 func (m model) handleEditKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "ctrl+c":
+	if msg.String() == "ctrl+c" {
 		return m, tea.Quit
+	}
+	switch m.editSec {
+	case secStatus, secPriority:
+		return m.handleChoiceKey(msg)
+	case secTitle:
+		return m.handleInputKey(msg)
+	default: // description, notes
+		return m.handleAreaKey(msg)
+	}
+}
+
+// handleChoiceKey cycles the status/priority options; enter commits.
+func (m model) handleChoiceKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	n := 5 // priority 0-4
+	if m.editSec == secStatus {
+		n = len(editStatuses)
+	}
+	switch msg.String() {
 	case "esc":
-		m.editing = false
-	case "tab":
-		m.editField = (m.editField + 1) % len(editFields)
-	case "shift+tab":
-		m.editField = (m.editField - 1 + len(editFields)) % len(editFields)
+		m.cancelEdit()
+	case "left", "up", "h", "k":
+		m.choice = (m.choice - 1 + n) % n
+		m.renderFields()
+	case "right", "down", "l", "j", "tab":
+		m.choice = (m.choice + 1) % n
+		m.renderFields()
 	case "enter":
-		m.editing = false
-		if id := m.currentEpic(); id != "" {
-			return m, m.editCmd(id, editFields[m.editField])
-		}
+		return m.commitEdit()
 	}
 	return m, nil
+}
+
+// handleInputKey edits the title; enter commits, esc cancels.
+func (m model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.cancelEdit()
+		return m, nil
+	case "enter":
+		return m.commitEdit()
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	m.renderFields()
+	return m, cmd
+}
+
+// handleAreaKey edits description/notes; ctrl+s commits, esc cancels, enter is a
+// newline.
+func (m model) handleAreaKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.cancelEdit()
+		return m, nil
+	case "ctrl+s":
+		return m.commitEdit()
+	}
+	var cmd tea.Cmd
+	m.area, cmd = m.area.Update(msg)
+	m.renderFields()
+	return m, cmd
+}
+
+func (m *model) cancelEdit() {
+	m.editing = false
+	m.input.Blur()
+	m.area.Blur()
+	m.renderFields()
+}
+
+// commitEdit persists the edited value and reloads.
+func (m model) commitEdit() (tea.Model, tea.Cmd) {
+	id := m.currentEpic()
+	field, value := m.editValue()
+	m.cancelEdit()
+	if id == "" || field == "" {
+		return m, nil
+	}
+	m.loading = true
+	return m, tea.Batch(m.spinner.Tick, m.updateCmd(id, field, value))
+}
+
+func (m model) editValue() (field, value string) {
+	switch m.editSec {
+	case secTitle:
+		return "title", m.input.Value()
+	case secStatus:
+		return "status", editStatuses[m.choice]
+	case secPriority:
+		return "priority", strconv.Itoa(m.choice)
+	case secDescription:
+		return "description", m.area.Value()
+	case secNotes:
+		return "notes", m.area.Value()
+	}
+	return "", ""
+}
+
+func indexOf(ss []string, s string) int {
+	for i, v := range ss {
+		if v == s {
+			return i
+		}
+	}
+	return -1
 }
 
 func (m *model) moveEpic(d int) {
