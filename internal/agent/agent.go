@@ -19,10 +19,10 @@ import (
 	"time"
 )
 
-// needsInputMarker is the sentinel the spawn prompt asks the agent to emit when
+// NeedsInputMarker is the sentinel the spawn prompt asks the agent to emit when
 // it is blocked or unsure, so a run that ends this way is surfaced as a prompt
 // for the user rather than a completion.
-const needsInputMarker = "⟨NEEDS INPUT⟩"
+const NeedsInputMarker = "⟨NEEDS INPUT⟩"
 
 // Status is an agent's lifecycle state.
 type Status int
@@ -277,7 +277,7 @@ func (m *Manager) finalize(a *agent, waitErr error, logPath string) {
 		a.Status = Intervened
 	case a.killIntent:
 		a.Status = Killed
-	case strings.Contains(a.pendingResult, needsInputMarker):
+	case strings.Contains(a.pendingResult, NeedsInputMarker):
 		a.Status = NeedsInput
 		a.Question = extractQuestion(a.pendingResult)
 	case waitErr != nil:
@@ -469,7 +469,7 @@ func firstLine(s string) string {
 // extractQuestion returns the agent's ask: the text following the needs-input
 // marker, or the whole result if the marker sits at the end.
 func extractQuestion(result string) string {
-	before, after, found := strings.Cut(result, needsInputMarker)
+	before, after, found := strings.Cut(result, NeedsInputMarker)
 	if !found {
 		return firstLine(result)
 	}
