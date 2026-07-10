@@ -74,6 +74,10 @@ func (m model) headerLine() string {
 }
 
 func (m model) footerLine() string {
+	if m.searching {
+		return "  " + dimStyle.Render("search ") + m.search.View() +
+			dimStyle.Render("  · enter keep · esc clear")
+	}
 	var keys string
 	switch {
 	case m.editing:
@@ -88,11 +92,11 @@ func (m model) footerLine() string {
 	case m.taskOpen:
 		keys = "tab field · e edit · ↑/↓ scroll · esc back · q quit"
 	case m.focused && m.section == secTasks:
-		keys = "↑/↓ task · enter open · tab section · esc back · q quit"
+		keys = "↑/↓ task · enter open · / search · tab section · esc back"
 	case m.focused:
 		keys = "tab section · e edit · ↑/↓ scroll · esc back · q quit"
 	default:
-		keys = "↑/↓ move · → open · w wrap · r refresh · q quit"
+		keys = "↑/↓ move · → open · / search · w wrap · r refresh · q quit"
 	}
 	return dimStyle.Render("  " + keys)
 }
@@ -148,8 +152,11 @@ func (m model) taskPreviewContent(width, height int) string {
 // epic is a block of one or more lines (multiple only when wrap is on), and the
 // window keeps the cursor's block visible.
 func (m model) epicsContent(width, height int) string {
-	epics := m.graph.Epics
+	epics := m.visibleEpics()
 	if len(epics) == 0 {
+		if m.searchScope == scopeEpics && m.query() != "" {
+			return dimStyle.Render("no match")
+		}
 		return dimStyle.Render("no epics")
 	}
 	rows := max(height-2, 1) // header + spacer
@@ -162,6 +169,9 @@ func (m model) epicsContent(width, height int) string {
 	title := fmt.Sprintf("EPICS (%d)", len(epics))
 	if m.wrap {
 		title += "  ⏎ wrapped"
+	}
+	if m.searchScope == scopeEpics && m.query() != "" {
+		title += "  /" + m.query()
 	}
 
 	var b strings.Builder
@@ -229,18 +239,26 @@ func (m model) renderWrappedRow(id string, selected bool, width int) []string {
 // taskListContent renders the current epic's tasks in the lower-right region,
 // highlighting the task cursor when the task-list section is focused.
 func (m model) taskListContent(width, height int) string {
-	tasks := m.currentEpicTasks()
+	tasks := m.visibleTasks()
 	active := m.focused && m.section == secTasks
+	filtered := m.searchScope == scopeTasks && m.query() != ""
 
 	var b strings.Builder
 	hdr := fmt.Sprintf("TASKS (%d)", len(tasks))
+	if filtered {
+		hdr += " /" + m.query()
+	}
 	if active {
 		b.WriteString(selectedStyle.Render(" " + hdr + " "))
 	} else {
 		b.WriteString(dimStyle.Render(hdr))
 	}
 	if len(tasks) == 0 {
-		fmt.Fprintf(&b, "\n%s", dimStyle.Render("no tasks"))
+		msg := "no tasks"
+		if filtered {
+			msg = "no match"
+		}
+		fmt.Fprintf(&b, "\n%s", dimStyle.Render(msg))
 		return b.String()
 	}
 	b.WriteString("\n\n")

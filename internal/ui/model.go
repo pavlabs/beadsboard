@@ -2,7 +2,9 @@ package ui
 
 import (
 	"context"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -27,6 +29,10 @@ type model struct {
 
 	epicCursor int
 	wrap       bool // wrap epic titles in the list instead of truncating
+
+	searching   bool            // the search input is capturing keys
+	searchScope int             // which list the query filters (scope* below)
+	search      textinput.Model // fuzzy search query
 
 	focused    bool // right pane (fields + tasks) has focus
 	section    int  // which right-pane section is selected (sec* below)
@@ -60,6 +66,12 @@ const (
 // same fields as an epic minus the task-list section (a task has no subtasks).
 const taskSectionCount = secTasks
 
+// Search scopes: which list an active query filters.
+const (
+	scopeEpics = iota
+	scopeTasks
+)
+
 // editStatuses are the statuses the status field cycles through when editing.
 var editStatuses = []string{"open", "in_progress", "blocked", "closed"}
 
@@ -80,18 +92,20 @@ type (
 
 // newInputs builds the title and description/notes editors with their shared
 // configuration.
-func newInputs() (textinput.Model, textarea.Model) {
-	ta := textarea.New()
-	ta.ShowLineNumbers = false
-	ta.Prompt = ""
-	return textinput.New(), ta
+func newInputs() (title textinput.Model, body textarea.Model, search textinput.Model) {
+	body = textarea.New()
+	body.ShowLineNumbers = false
+	body.Prompt = ""
+	search = textinput.New()
+	search.Prompt = ""
+	return textinput.New(), body, search
 }
 
 // New builds the root model for the given target directory.
 func New(dir string) model {
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
-	ti, ta := newInputs()
+	ti, ta, se := newInputs()
 
 	return model{
 		client:  beads.NewClient(dir),
@@ -100,6 +114,7 @@ func New(dir string) model {
 		detail:  viewport.New(0, 0),
 		input:   ti,
 		area:    ta,
+		search:  se,
 	}
 }
 
@@ -215,6 +230,9 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.editing {
 		return m.handleEditKey(msg)
 	}
+	if m.searching {
+		return m.handleSearchKey(msg)
+	}
 	switch msg.String() {
 	case "q", "ctrl+c":
 		return m, tea.Quit
@@ -242,10 +260,19 @@ func (m model) handleLeftKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "down", "j":
 		m.moveEpic(1)
 		m.syncDetail()
+	case "esc":
+		if m.query() != "" { // clear a confirmed filter
+			m.clearSearch()
+			m.clampCursors()
+			m.syncDetail()
+		}
 	case "w":
 		m.wrap = !m.wrap
+	case "/":
+		m.startSearch(scopeEpics)
 	case "enter", "l", "right":
 		if m.currentEpic() != "" {
+			m.clearSearch()
 			m.focused = true
 			m.section = secTitle
 			m.taskCursor = 0
@@ -258,7 +285,18 @@ func (m model) handleLeftKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // handleRightKey drives the fields + task-list sections of the right pane.
 func (m model) handleRightKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "esc", "h", "left":
+	case "esc":
+		if m.searchScope == scopeTasks && m.query() != "" {
+			m.clearSearch() // first esc clears the task filter, stay focused
+			m.clampCursors()
+			m.syncDetail()
+			return m, nil
+		}
+		m.clearSearch()
+		m.focused = false
+		m.syncDetail()
+	case "h", "left":
+		m.clearSearch()
 		m.focused = false
 		m.syncDetail()
 	case "tab":
@@ -270,6 +308,10 @@ func (m model) handleRightKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "e":
 		if !m.loading && m.section != secTasks {
 			m.beginEdit()
+		}
+	case "/":
+		if m.section == secTasks {
+			m.startSearch(scopeTasks)
 		}
 	case "enter", "l", "right":
 		if m.section == secTasks && m.currentTask() != "" {
@@ -331,6 +373,106 @@ func (m *model) closeTask() {
 	m.section = secTasks
 	m.resizeDetail()
 	m.syncDetail()
+}
+
+// startSearch opens an incremental fuzzy filter over the given list scope.
+func (m *model) startSearch(scope int) {
+	m.searching = true
+	m.searchScope = scope
+	m.search.SetValue("")
+	m.search.Focus()
+}
+
+// clearSearch drops any active filter and closes the search input.
+func (m *model) clearSearch() {
+	m.searching = false
+	m.search.SetValue("")
+	m.search.Blur()
+}
+
+// query is the active filter text.
+func (m model) query() string { return m.search.Value() }
+
+// handleSearchKey feeds the incremental search: enter keeps the filter, esc
+// clears it, everything else edits the query and re-anchors the cursor to the
+// best match.
+func (m model) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc":
+		m.clearSearch()
+		m.clampCursors()
+		m.syncDetail()
+		return m, nil
+	case "enter":
+		m.searching = false // keep the filter, stop capturing keys
+		m.search.Blur()
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.search, cmd = m.search.Update(msg)
+	if m.searchScope == scopeTasks {
+		m.taskCursor = 0
+	} else {
+		m.epicCursor = 0
+	}
+	m.syncDetail() // preview follows the top match live
+	return m, cmd
+}
+
+// fuzzyFilter keeps the ids whose text loosely matches query, ranked best-first
+// (tighter, earlier matches win; original order breaks ties).
+func fuzzyFilter(ids []string, query string, text func(string) string) []string {
+	if query == "" {
+		return ids
+	}
+	type scored struct {
+		id    string
+		score int
+		order int
+	}
+	var hits []scored
+	for i, id := range ids {
+		if s, ok := fuzzyScore(text(id), query); ok {
+			hits = append(hits, scored{id, s, i})
+		}
+	}
+	sort.SliceStable(hits, func(a, b int) bool {
+		if hits[a].score != hits[b].score {
+			return hits[a].score < hits[b].score
+		}
+		return hits[a].order < hits[b].order
+	})
+	out := make([]string, len(hits))
+	for i, h := range hits {
+		out[i] = h.id
+	}
+	return out
+}
+
+// fuzzyScore matches query as a case-insensitive subsequence of target and
+// returns a penalty (lower is better) for gaps and a late first match, or false
+// if query is not a subsequence.
+func fuzzyScore(target, query string) (int, bool) {
+	tr := []rune(strings.ToLower(target))
+	qr := []rune(strings.ToLower(query))
+	ti, qi, gaps, first := 0, 0, 0, -1
+	for ti < len(tr) && qi < len(qr) {
+		if tr[ti] == qr[qi] {
+			if first < 0 {
+				first = ti
+			}
+			qi++
+		} else if qi > 0 {
+			gaps++ // only gaps between matched runes count
+		}
+		ti++
+	}
+	if qi < len(qr) {
+		return 0, false
+	}
+	return gaps + first, true
 }
 
 // beginEdit opens the inline editor for the focused field, primed with its
@@ -474,14 +616,15 @@ func indexOf(ss []string, s string) int {
 }
 
 func (m *model) moveEpic(d int) {
-	if m.graph == nil || len(m.graph.Epics) == 0 {
+	n := len(m.visibleEpics())
+	if n == 0 {
 		return
 	}
-	m.epicCursor = min(max(m.epicCursor+d, 0), len(m.graph.Epics)-1)
+	m.epicCursor = min(max(m.epicCursor+d, 0), n-1)
 }
 
 func (m *model) moveTask(d int) {
-	n := len(m.currentEpicTasks())
+	n := len(m.visibleTasks())
 	if n == 0 {
 		return
 	}
@@ -492,26 +635,52 @@ func (m *model) clampCursors() {
 	if m.graph == nil {
 		return
 	}
-	m.epicCursor = min(max(m.epicCursor, 0), max(len(m.graph.Epics)-1, 0))
-	m.taskCursor = min(max(m.taskCursor, 0), max(len(m.currentEpicTasks())-1, 0))
+	m.epicCursor = min(max(m.epicCursor, 0), max(len(m.visibleEpics())-1, 0))
+	m.taskCursor = min(max(m.taskCursor, 0), max(len(m.visibleTasks())-1, 0))
 }
 
 // currentEpic is the epic the cursor is highlighting, or "".
 func (m model) currentEpic() string {
-	if m.graph == nil || m.epicCursor < 0 || m.epicCursor >= len(m.graph.Epics) {
+	epics := m.visibleEpics()
+	if m.epicCursor < 0 || m.epicCursor >= len(epics) {
 		return ""
 	}
-	return m.graph.Epics[m.epicCursor]
+	return epics[m.epicCursor]
 }
 
 // currentTask is the task the cursor is highlighting within the current epic, or
 // "".
 func (m model) currentTask() string {
-	tasks := m.currentEpicTasks()
+	tasks := m.visibleTasks()
 	if m.taskCursor < 0 || m.taskCursor >= len(tasks) {
 		return ""
 	}
 	return tasks[m.taskCursor]
+}
+
+// visibleEpics is the epic list after applying an active epic-scoped filter.
+func (m model) visibleEpics() []string {
+	if m.graph == nil {
+		return nil
+	}
+	if m.searchScope == scopeEpics && m.query() != "" {
+		return fuzzyFilter(m.graph.Epics, m.query(), func(id string) string {
+			return m.graph.Issues[id].Title
+		})
+	}
+	return m.graph.Epics
+}
+
+// visibleTasks is the current epic's task list after applying an active
+// task-scoped filter.
+func (m model) visibleTasks() []string {
+	tasks := m.currentEpicTasks()
+	if m.searchScope == scopeTasks && m.query() != "" {
+		return fuzzyFilter(tasks, m.query(), func(id string) string {
+			return m.graph.Issues[id].Title
+		})
+	}
+	return tasks
 }
 
 // target is the issue that field navigation and editing act on: the drilled-into

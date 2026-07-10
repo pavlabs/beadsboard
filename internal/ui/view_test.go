@@ -42,7 +42,7 @@ func testModel() model {
 		"b.1": {ID: "b.1", Title: "ship it", IssueType: "task", Status: "open", Dependencies: []beads.Dep{{DependsOnID: "b", Type: "parent-child"}, {DependsOnID: "a.2", Type: "blocks"}}},
 	}
 	m := model{client: beads.NewClient("testdir"), graph: beads.BuildGraph(issues), detail: viewport.New(0, 0)}
-	m.input, m.area = newInputs()
+	m.input, m.area, m.search = newInputs()
 	m.width, m.height = 120, 30
 	m.resizeDetail()
 	m.syncDetail()
@@ -168,6 +168,84 @@ func TestFocusModelSections(t *testing.T) {
 	next, _ = m.handleKey(keyMsg("esc"))
 	m = next.(model)
 	require.False(t, m.focused)
+}
+
+func typeKeys(m model, s string) model {
+	for _, r := range s {
+		next, _ := m.handleKey(keyMsg(string(r)))
+		m = next.(model)
+	}
+	return m
+}
+
+// fuzzyScore matches a case-insensitive subsequence and ranks earlier, tighter
+// matches lower (better).
+func TestFuzzyScore(t *testing.T) {
+	_, ok := fuzzyScore("Beta epic", "beta")
+	require.True(t, ok)
+	_, ok = fuzzyScore("Alpha epic", "beta")
+	require.False(t, ok, "not a subsequence")
+
+	tight, _ := fuzzyScore("build it", "bi")
+	loose, _ := fuzzyScore("blah build it", "bi")
+	require.Less(t, tight, loose, "earlier, tighter match scores better")
+}
+
+// / opens an incremental fuzzy filter over the epic list; enter keeps it, esc
+// clears it.
+func TestSearchFiltersEpics(t *testing.T) {
+	m := testModel()
+	next, _ := m.handleKey(keyMsg("/"))
+	m = next.(model)
+	require.True(t, m.searching)
+	require.Equal(t, scopeEpics, m.searchScope)
+
+	m = typeKeys(m, "beta")
+	require.Equal(t, []string{"b"}, m.visibleEpics(), "only Beta epic matches")
+	require.Equal(t, "b", m.currentEpic(), "cursor re-anchors to the match")
+
+	next, _ = m.handleKey(keyMsg("enter"))
+	m = next.(model)
+	require.False(t, m.searching)
+	require.Equal(t, "b", m.currentEpic(), "confirm keeps the filter")
+
+	next, _ = m.handleKey(keyMsg("/"))
+	m = next.(model)
+	m = typeKeys(m, "beta")
+	next, _ = m.handleKey(keyMsg("esc"))
+	m = next.(model)
+	require.False(t, m.searching)
+	require.Len(t, m.visibleEpics(), 2, "esc clears the filter")
+}
+
+// esc in the list clears a filter that was confirmed with enter.
+func TestSearchEscClearsConfirmed(t *testing.T) {
+	m := testModel()
+	next, _ := m.handleKey(keyMsg("/"))
+	m = next.(model)
+	m = typeKeys(m, "beta")
+	next, _ = m.handleKey(keyMsg("enter"))
+	m = next.(model)
+	require.Len(t, m.visibleEpics(), 1)
+
+	next, _ = m.handleKey(keyMsg("esc"))
+	m = next.(model)
+	require.Len(t, m.visibleEpics(), 2, "esc clears a confirmed filter")
+}
+
+// In the task-list section, / filters the current epic's tasks.
+func TestSearchScopesTasks(t *testing.T) {
+	m := testModel() // epic "a" has a.1 "design", a.2 "build it"
+	m.focused = true
+	m.section = secTasks
+
+	next, _ := m.handleKey(keyMsg("/"))
+	m = next.(model)
+	require.True(t, m.searching)
+	require.Equal(t, scopeTasks, m.searchScope)
+
+	m = typeKeys(m, "design")
+	require.Equal(t, []string{"a.1"}, m.visibleTasks())
 }
 
 // w toggles wrap-all: a long epic title that truncates by default renders across
