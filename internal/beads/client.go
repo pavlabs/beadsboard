@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 )
@@ -90,6 +91,23 @@ func (c *Client) Update(ctx context.Context, id, field, value string) error {
 	cmd.Dir = c.Dir
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("bd update: %w: %s", err, sanitize(strings.TrimSpace(string(out))))
+	}
+	return nil
+}
+
+// Sync pushes a single issue's current state to GitHub via
+// `bd github sync --push-only --issues <id>`. repo, when set ("owner/repo"),
+// overrides bd's configured target through GITHUB_REPOSITORY; otherwise bd's own
+// github config applies. Push-only and issue-scoped so a status edit never pulls
+// unrelated remote changes into the local DB behind the user's back.
+func (c *Client) Sync(ctx context.Context, id, repo string) error {
+	cmd := exec.CommandContext(ctx, "bd", "github", "sync", "--push-only", "--issues", id)
+	cmd.Dir = c.Dir
+	if repo != "" {
+		cmd.Env = append(os.Environ(), "GITHUB_REPOSITORY="+repo)
+	}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("bd github sync: %w: %s", err, sanitize(strings.TrimSpace(string(out))))
 	}
 	return nil
 }

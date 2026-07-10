@@ -49,6 +49,7 @@ type model struct {
 	choice  int             // status index / priority value while cycling
 
 	cfg        config.Config
+	cfgPath    string // resolved config file we watch and save back to
 	cfgModTime time.Time
 	mgr        *agent.Manager
 
@@ -108,10 +109,14 @@ type (
 		fp  uint64
 		err error
 	}
-	editSavedMsg  struct{ err error }
+	editSavedMsg struct {
+		err    error
+		syncID string // issue to push to GitHub after this save, or "" for none
+	}
 	agentEventMsg struct{}
 	spawnedMsg    struct{ err error }
 	interveneMsg  struct{ err error }
+	syncedMsg     struct{ err error }
 )
 
 // newInputs builds the title and description/notes editors with their shared
@@ -131,15 +136,13 @@ func New(dir string) model {
 	sp.Spinner = spinner.Dot
 	ti, ta, se := newInputs()
 
-	cfg, _ := config.Load()
+	cfg, cfgPath, _ := config.Load(dir)
 	mgr := agent.New(dir, "claude", cfg.MaxAgents)
 	mgr.Sweep() // clear scratch from any prior crashed run
 
 	var modTime time.Time
-	if p, err := config.Path(); err == nil {
-		if fi, err := os.Stat(p); err == nil {
-			modTime = fi.ModTime()
-		}
+	if fi, err := os.Stat(cfgPath); err == nil {
+		modTime = fi.ModTime()
 	}
 
 	return model{
@@ -151,6 +154,7 @@ func New(dir string) model {
 		area:       ta,
 		search:     se,
 		cfg:        cfg,
+		cfgPath:    cfgPath,
 		cfgModTime: modTime,
 		mgr:        mgr,
 	}
@@ -207,13 +211,27 @@ func (m model) startReload() (tea.Model, tea.Cmd) {
 	return m, tea.Batch(m.spinner.Tick, m.hydrateCmd())
 }
 
-// updateCmd persists a field edit via `bd update` off the UI goroutine.
-func (m model) updateCmd(id, field, value string) tea.Cmd {
+// updateCmd persists a field edit via `bd update` off the UI goroutine. syncID,
+// when set, rides back on the result so the save handler can push that issue to
+// GitHub once the local write lands.
+func (m model) updateCmd(id, field, value, syncID string) tea.Cmd {
 	client := m.client
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		return editSavedMsg{err: client.Update(ctx, id, field, value)}
+		return editSavedMsg{err: client.Update(ctx, id, field, value), syncID: syncID}
+	}
+}
+
+// githubSyncCmd pushes a single issue's current state to GitHub off the UI
+// goroutine. It runs concurrently with the reload so a slow API call never
+// blocks the interface.
+func (m model) githubSyncCmd(id string) tea.Cmd {
+	client, repo := m.client, m.cfg.GitHubRepository
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		return syncedMsg{err: client.Sync(ctx, id, repo)}
 	}
 }
 
@@ -280,7 +298,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = msg.err
 			return m, nil
 		}
-		return m.startReload() // reflect the saved change immediately
+		reloaded, cmd := m.startReload() // reflect the saved change immediately
+		if msg.syncID != "" {
+			return reloaded, tea.Batch(cmd, m.githubSyncCmd(msg.syncID))
+		}
+		return reloaded, cmd
+
+	case syncedMsg:
+		if msg.err != nil {
+			m.notice = msg.err.Error()
+		}
+		return m, nil
 
 	case spinner.TickMsg:
 		if !m.loading {
@@ -683,8 +711,18 @@ func (m model) commitEdit() (tea.Model, tea.Cmd) {
 	if id == "" || field == "" {
 		return m, nil
 	}
+	syncID := ""
+	if m.shouldSync(field) {
+		syncID = id // push this status change to GitHub once the local write lands
+	}
 	m.loading = true
-	return m, tea.Batch(m.spinner.Tick, m.updateCmd(id, field, value))
+	return m, tea.Batch(m.spinner.Tick, m.updateCmd(id, field, value, syncID))
+}
+
+// shouldSync reports whether persisting field should also push the issue to
+// GitHub. Only status changes sync, and only when the feature is enabled.
+func (m model) shouldSync(field string) bool {
+	return field == "status" && m.cfg.GitHubSync
 }
 
 func (m model) editValue() (field, value string) {

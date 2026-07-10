@@ -1,7 +1,8 @@
-// Package config loads and persists beadsboard's user settings from
-// ~/.beadsboard/config.toml. The file is created with defaults on first run and
-// re-read whenever it changes on disk, so edits (external or via the in-app
-// settings panel) apply live.
+// Package config loads and persists beadsboard's user settings. A per-directory
+// ./.beadsboard/config.toml beside the source repo is the source of truth when
+// present; otherwise the global ~/.beadsboard/config.toml applies. The chosen
+// file is created with defaults on first run and re-read whenever it changes on
+// disk, so edits (external or via the in-app settings panel) apply live.
 package config
 
 import (
@@ -21,6 +22,9 @@ type Config struct {
 	PermissionMode string            `toml:"permission_mode"`
 	RecentTTLSecs  int               `toml:"recent_ttl_secs"` // how long finished agents linger
 	Tools          map[string]string `toml:"tools"`           // tool name -> "read" | "write"
+
+	GitHubSync       bool   `toml:"github_sync"`       // push task status changes via `bd github sync`
+	GitHubRepository string `toml:"github_repository"` // "owner/repo"; empty = use bd's own github config
 }
 
 // Default is the configuration written on first run and used as the base that
@@ -40,42 +44,61 @@ func Default() Config {
 			"gcloud": "read",
 			"aws":    "read",
 		},
+		GitHubSync:       false,
+		GitHubRepository: "",
 	}
 }
 
-// Path is the config file location, ~/.beadsboard/config.toml.
-func Path() (string, error) {
+// dirName and fileName make up ".beadsboard/config.toml", used both for the
+// global (under $HOME) and the local (under a source repo) config.
+const (
+	dirName  = ".beadsboard"
+	fileName = "config.toml"
+)
+
+// globalPath is ~/.beadsboard/config.toml.
+func globalPath() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("home dir: %w", err)
 	}
-	return filepath.Join(home, ".beadsboard", "config.toml"), nil
+	return filepath.Join(home, dirName, fileName), nil
 }
 
-// Load reads the config, creating it with defaults if it does not yet exist.
-func Load() (Config, error) {
+// Resolve returns the config file governing dir: a local ./.beadsboard/
+// config.toml beside the source repo when present (the source of truth),
+// otherwise the global ~/.beadsboard/config.toml.
+func Resolve(dir string) (string, error) {
+	local := filepath.Join(dir, dirName, fileName)
+	if _, err := os.Stat(local); err == nil {
+		return local, nil
+	}
+	return globalPath()
+}
+
+// Load reads the config governing dir and returns it with the resolved path, so
+// the caller can watch and save back to the same file. A missing file is
+// created with defaults (only reachable for the global fallback, since a local
+// path is only chosen when it already exists).
+func Load(dir string) (Config, string, error) {
 	cfg := Default()
-	path, err := Path()
+	path, err := Resolve(dir)
 	if err != nil {
-		return cfg, err
+		return cfg, "", err
 	}
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return cfg, Save(cfg)
+		return cfg, path, Save(cfg, path)
 	}
 	if _, err := toml.DecodeFile(path, &cfg); err != nil {
-		return cfg, fmt.Errorf("decode config: %w", err)
+		return cfg, path, fmt.Errorf("decode config: %w", err)
 	}
-	return cfg, nil
+	return cfg, path, nil
 }
 
 const header = "# beadsboard settings — edits apply live\n\n"
 
-// Save writes the config to disk, creating the directory as needed.
-func Save(cfg Config) error {
-	path, err := Path()
-	if err != nil {
-		return err
-	}
+// Save writes the config to path, creating the directory as needed.
+func Save(cfg Config, path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("config dir: %w", err)
 	}

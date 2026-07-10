@@ -158,16 +158,13 @@ func (m model) anyNeedsInput() bool {
 // --- config live-reload -------------------------------------------------------
 
 func (m *model) reloadConfigIfChanged() {
-	p, err := config.Path()
-	if err != nil {
-		return
-	}
-	fi, err := os.Stat(p)
+	fi, err := os.Stat(m.cfgPath)
 	if err != nil || fi.ModTime().Equal(m.cfgModTime) {
 		return
 	}
-	if cfg, err := config.Load(); err == nil {
+	if cfg, path, err := config.Load(m.client.Dir); err == nil {
 		m.cfg = cfg
+		m.cfgPath = path
 		m.mgr.SetMaxAgents(cfg.MaxAgents)
 	}
 	m.cfgModTime = fi.ModTime()
@@ -203,14 +200,12 @@ func (m model) handleSettingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "right", "l":
 		m.adjustSetting(1)
 	case "s", "enter":
-		if err := config.Save(m.cfg); err != nil {
+		if err := config.Save(m.cfg, m.cfgPath); err != nil {
 			m.notice = err.Error()
 		}
 		m.mgr.SetMaxAgents(m.cfg.MaxAgents)
-		if p, err := config.Path(); err == nil {
-			if fi, err := os.Stat(p); err == nil {
-				m.cfgModTime = fi.ModTime() // absorb our own write
-			}
+		if fi, err := os.Stat(m.cfgPath); err == nil {
+			m.cfgModTime = fi.ModTime() // absorb our own write
 		}
 		m.settingsOpen = false
 	}
@@ -360,7 +355,7 @@ func (m model) settingsView(width, height int) string {
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s\n\n", dimStyle.Render("SETTINGS  ~/.beadsboard/config.toml"))
+	fmt.Fprintf(&b, "%s\n\n", dimStyle.Render("SETTINGS  "+tildePath(m.cfgPath)))
 	for i, f := range fields {
 		line := fmt.Sprintf("%-12s ‹ %s ›", f.label, f.val)
 		if i == m.setField {
@@ -370,8 +365,16 @@ func (m model) settingsView(width, height int) string {
 		}
 		b.WriteByte('\n')
 	}
-	b.WriteString("\n" + dimStyle.Render("tool permissions live in the config file"))
+	b.WriteString("\n" + dimStyle.Render("tools & github sync live in the config file"))
 	return b.String()
+}
+
+// tildePath abbreviates the user's home directory to ~ for display.
+func tildePath(p string) string {
+	if home, err := os.UserHomeDir(); err == nil && strings.HasPrefix(p, home) {
+		return "~" + p[len(home):]
+	}
+	return p
 }
 
 func turnsLabel(n int) string {
