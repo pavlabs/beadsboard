@@ -9,7 +9,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/stretchr/testify/require"
 
+	"github.com/pavlabs/beadsboard/internal/agent"
 	"github.com/pavlabs/beadsboard/internal/beads"
+	"github.com/pavlabs/beadsboard/internal/config"
 )
 
 func keyMsg(s string) tea.KeyMsg {
@@ -42,6 +44,8 @@ func testModel() model {
 		"b.1": {ID: "b.1", Title: "ship it", IssueType: "task", Status: "open", Dependencies: []beads.Dep{{DependsOnID: "b", Type: "parent-child"}, {DependsOnID: "a.2", Type: "blocks"}}},
 	}
 	m := model{client: beads.NewClient("testdir"), graph: beads.BuildGraph(issues), detail: viewport.New(0, 0)}
+	m.cfg = config.Default()
+	m.mgr = agent.New("testdir", "claude", m.cfg.MaxAgents)
 	m.input, m.area, m.search = newInputs()
 	m.width, m.height = 120, 30
 	m.resizeDetail()

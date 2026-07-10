@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,7 +14,9 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/pavlabs/beadsboard/internal/agent"
 	"github.com/pavlabs/beadsboard/internal/beads"
+	"github.com/pavlabs/beadsboard/internal/config"
 )
 
 const refreshInterval = time.Second
@@ -45,11 +48,29 @@ type model struct {
 	area    textarea.Model  // description/notes editor
 	choice  int             // status index / priority value while cycling
 
+	cfg        config.Config
+	cfgModTime time.Time
+	mgr        *agent.Manager
+
+	tab         int  // tabDetails | tabAgents
+	agentCursor int  // selected agent in the Agents tab
+	showAll     bool // Agents tab: all agents vs scoped to the hovered epic
+	notice      string
+
+	settingsOpen bool
+	setField     int // which setting the cursor is on
+
 	fp    uint64
 	hasFP bool
 
 	width, height int
 }
+
+// Right-pane tabs.
+const (
+	tabDetails = iota
+	tabAgents
+)
 
 // Right-pane sections the cursor cycles through with tab.
 const (
@@ -87,7 +108,10 @@ type (
 		fp  uint64
 		err error
 	}
-	editSavedMsg struct{ err error }
+	editSavedMsg  struct{ err error }
+	agentEventMsg struct{}
+	spawnedMsg    struct{ err error }
+	interveneMsg  struct{ err error }
 )
 
 // newInputs builds the title and description/notes editors with their shared
@@ -107,21 +131,45 @@ func New(dir string) model {
 	sp.Spinner = spinner.Dot
 	ti, ta, se := newInputs()
 
+	cfg, _ := config.Load()
+	mgr := agent.New(dir, "claude", cfg.MaxAgents)
+	mgr.Sweep() // clear scratch from any prior crashed run
+
+	var modTime time.Time
+	if p, err := config.Path(); err == nil {
+		if fi, err := os.Stat(p); err == nil {
+			modTime = fi.ModTime()
+		}
+	}
+
 	return model{
-		client:  beads.NewClient(dir),
-		loading: true,
-		spinner: sp,
-		detail:  viewport.New(0, 0),
-		input:   ti,
-		area:    ta,
-		search:  se,
+		client:     beads.NewClient(dir),
+		loading:    true,
+		spinner:    sp,
+		detail:     viewport.New(0, 0),
+		input:      ti,
+		area:       ta,
+		search:     se,
+		cfg:        cfg,
+		cfgModTime: modTime,
+		mgr:        mgr,
 	}
 }
 
 func (m model) Init() tea.Cmd {
 	// The post-load fingerprint from hydrateCmd seeds the watcher baseline, so
 	// no independent fpCmd here.
-	return tea.Batch(m.spinner.Tick, m.hydrateCmd(), tickCmd())
+	return tea.Batch(m.spinner.Tick, m.hydrateCmd(), tickCmd(), m.waitAgentEvent())
+}
+
+// waitAgentEvent blocks on the manager's event channel and re-arms itself, so
+// agent state changes drive re-renders without polling.
+func (m model) waitAgentEvent() tea.Cmd {
+	ch := m.mgr.Events()
+	return func() tea.Msg {
+		<-ch
+		return agentEventMsg{}
+	}
 }
 
 func (m model) hydrateCmd() tea.Cmd {
@@ -194,7 +242,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tickMsg:
+		m.reloadConfigIfChanged()
+		m.mgr.PruneRecent(time.Duration(m.cfg.RecentTTLSecs) * time.Second)
 		return m, tea.Batch(m.fpCmd(), tickCmd())
+
+	case agentEventMsg:
+		m.clampAgentCursor()
+		m.resizeDetail() // tab bar appearing/disappearing shifts the right pane
+		return m, m.waitAgentEvent()
+
+	case spawnedMsg:
+		if msg.err != nil {
+			m.notice = msg.err.Error()
+		}
+		return m, nil
+
+	case interveneMsg:
+		if msg.err != nil {
+			m.notice = msg.err.Error()
+		}
+		return m, nil
 
 	case fpMsg:
 		// Reload only when an external bd write moved the state away from the
@@ -230,9 +297,13 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.editing {
 		return m.handleEditKey(msg)
 	}
+	if m.settingsOpen {
+		return m.handleSettingsKey(msg)
+	}
 	if m.searching {
 		return m.handleSearchKey(msg)
 	}
+	m.notice = "" // any key dismisses a transient notice
 	switch msg.String() {
 	case "q", "ctrl+c":
 		return m, tea.Quit
@@ -241,6 +312,9 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.startReload()
 		}
 		return m, nil
+	}
+	if m.tab == tabAgents {
+		return m.handleAgentsKey(msg)
 	}
 	if m.taskOpen {
 		return m.handleTaskKey(msg)
@@ -270,6 +344,17 @@ func (m model) handleLeftKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.wrap = !m.wrap
 	case "/":
 		m.startSearch(scopeEpics)
+	case "a":
+		if id := m.currentEpic(); id != "" {
+			m.tab = tabAgents
+			return m, m.spawnCmd(id, "epic")
+		}
+	case "A":
+		m.tab = tabAgents
+		m.showAll = true
+		m.clampAgentCursor()
+	case "S":
+		m.openSettings()
 	case "enter", "l", "right":
 		if m.currentEpic() != "" {
 			m.clearSearch()
@@ -313,6 +398,13 @@ func (m model) handleRightKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.section == secTasks {
 			m.startSearch(scopeTasks)
 		}
+	case "a":
+		if m.section == secTasks {
+			if id := m.currentTask(); id != "" {
+				m.tab = tabAgents
+				return m, m.spawnCmd(id, "task")
+			}
+		}
 	case "enter", "l", "right":
 		if m.section == secTasks && m.currentTask() != "" {
 			m.openTask()
@@ -350,6 +442,11 @@ func (m model) handleTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "e":
 		if !m.loading {
 			m.beginEdit()
+		}
+	case "a":
+		if id := m.target(); id != "" {
+			m.tab = tabAgents
+			return m, m.spawnCmd(id, "task")
 		}
 	case "up", "k":
 		m.detail.ScrollUp(1)

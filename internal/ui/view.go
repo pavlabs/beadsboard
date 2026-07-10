@@ -29,17 +29,28 @@ func rightSplit(innerH int) (topContent, botContent int) {
 }
 
 func (m *model) resizeDetail() {
-	_, rightOuter, innerH := m.layout()
+	_, rightOuter, _ := m.layout()
+	rh := m.rightInnerH()
 	m.detail.Width = max(rightOuter-4, 1) // border + padding
 	if m.taskOpen {
-		m.detail.Height = innerH // task detail owns the whole right pane
+		m.detail.Height = rh // task detail owns the whole right pane
 	} else {
-		topContent, _ := rightSplit(innerH)
+		topContent, _ := rightSplit(rh)
 		m.detail.Height = topContent
 	}
 	m.input.Width = max(m.detail.Width-14, 8)
 	m.area.SetWidth(max(m.detail.Width, 8))
 	m.area.SetHeight(max(m.detail.Height-4, 3))
+}
+
+// rightInnerH is the right pane's usable inner height, one row less than the
+// left pane's when the tab bar is shown (i.e. when any agent exists).
+func (m model) rightInnerH() int {
+	_, _, innerH := m.layout()
+	if m.hasAgents() {
+		return innerH - 1
+	}
+	return innerH
 }
 
 func (m model) View() string {
@@ -70,16 +81,24 @@ func (m model) headerLine() string {
 	} else if m.err != nil && m.graph != nil {
 		sub += lipgloss.NewStyle().Foreground(yellow).Render("  ⚠ " + m.err.Error())
 	}
+	if m.notice != "" {
+		sub += lipgloss.NewStyle().Foreground(yellow).Render("  ⚠ " + m.notice)
+	}
 	return title + sub
 }
 
 func (m model) footerLine() string {
+	if m.settingsOpen {
+		return dimStyle.Render("  ↑/↓ field · ←/→ change · s save · esc cancel")
+	}
 	if m.searching {
 		return "  " + dimStyle.Render("search ") + m.search.View() +
 			dimStyle.Render("  · enter keep · esc clear")
 	}
 	var keys string
 	switch {
+	case m.tab == tabAgents:
+		keys = "↑/↓ select · enter intervene · k kill · x dismiss · A all · S settings · m back"
 	case m.editing:
 		switch m.editSec {
 		case secStatus, secPriority:
@@ -106,17 +125,26 @@ func (m model) panes() string {
 	rightInner := max(rightOuter-4, 1)
 	left := boxStyle.Width(leftOuter - 2).Height(innerH).Render(m.epicsContent(leftOuter-4, innerH))
 
+	rh := m.rightInnerH()
 	var right string
-	if m.taskOpen {
+	switch {
+	case m.settingsOpen:
+		right = boxStyle.Width(rightOuter - 2).Height(rh).Render(m.settingsView(rightInner, rh))
+	case m.tab == tabAgents:
+		right = m.agentsColumn(rightOuter, rh)
+	case m.taskOpen:
 		// A task's detail page takes the whole right pane — it has no subtasks.
-		right = boxStyle.Width(rightOuter - 2).Height(innerH).Render(m.detail.View())
-	} else {
-		topContent, botContent := rightSplit(innerH)
+		right = boxStyle.Width(rightOuter - 2).Height(rh).Render(m.detail.View())
+	default:
+		topContent, botContent := rightSplit(rh)
 		fields := boxStyle.Width(rightOuter - 2).Height(topContent).Render(m.detail.View())
 		tasks := boxStyle.Width(rightOuter - 2).Height(botContent).Render(m.taskBox(rightInner, botContent))
 		right = lipgloss.JoinVertical(lipgloss.Left, fields, tasks)
 	}
 
+	if m.hasAgents() {
+		right = lipgloss.JoinVertical(lipgloss.Left, m.tabBar(rightOuter-2), right)
+	}
 	return lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right)
 }
 
