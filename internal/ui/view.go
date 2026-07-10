@@ -18,14 +18,13 @@ func (m model) layout() (leftOuter, rightOuter, innerH int) {
 	return
 }
 
-// rightSplit divides the right pane's inner height. The epic metadata (top) gets
-// the majority so every field stays visible without scrolling; the task list
-// (bottom) takes ~30%. The two stacked boxes add 4 border rows total versus the
-// single left box's 2, so the usable content is innerH-2.
+// rightSplit divides the right pane's inner height evenly between the epic
+// metadata (top) and the task list (bottom). The two stacked boxes add 4 border
+// rows total versus the single left box's 2, so the usable content is innerH-2.
 func rightSplit(innerH int) (topContent, botContent int) {
 	usable := max(innerH-2, 2)
-	botContent = min(max(usable*3/10, 4), max(usable-4, 1))
-	topContent = usable - botContent
+	topContent = usable / 2
+	botContent = usable - topContent
 	return
 }
 
