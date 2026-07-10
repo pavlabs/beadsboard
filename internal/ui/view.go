@@ -92,7 +92,7 @@ func (m model) footerLine() string {
 	case m.focused:
 		keys = "tab section · e edit · ↑/↓ scroll · esc back · q quit"
 	default:
-		keys = "↑/↓ move · → open · r refresh · q quit"
+		keys = "↑/↓ move · → open · w wrap · r refresh · q quit"
 	}
 	return dimStyle.Render("  " + keys)
 }
@@ -144,7 +144,9 @@ func (m model) taskPreviewContent(width, height int) string {
 	return strings.Join(lines, "\n")
 }
 
-// epicsContent renders the epic list (left pane) with windowed scrolling.
+// epicsContent renders the epic list (left pane) with windowed scrolling. Each
+// epic is a block of one or more lines (multiple only when wrap is on), and the
+// window keeps the cursor's block visible.
 func (m model) epicsContent(width, height int) string {
 	epics := m.graph.Epics
 	if len(epics) == 0 {
@@ -152,18 +154,76 @@ func (m model) epicsContent(width, height int) string {
 	}
 	rows := max(height-2, 1) // header + spacer
 
-	start := windowStart(len(epics), m.epicCursor, rows)
-	end := min(start+rows, len(epics))
+	blocks := make([][]string, len(epics))
+	for i, id := range epics {
+		blocks[i] = m.renderEpicBlock(id, i == m.epicCursor, width)
+	}
+
+	title := fmt.Sprintf("EPICS (%d)", len(epics))
+	if m.wrap {
+		title += "  ⏎ wrapped"
+	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s\n\n", dimStyle.Render(fmt.Sprintf("EPICS (%d)", len(epics))))
-	for i := start; i < end; i++ {
-		b.WriteString(m.renderRow(epics[i], i == m.epicCursor, width))
-		if i < end-1 {
-			b.WriteByte('\n')
+	fmt.Fprintf(&b, "%s\n\n", dimStyle.Render(title))
+	b.WriteString(strings.Join(windowBlocks(blocks, m.epicCursor, rows), "\n"))
+	return b.String()
+}
+
+// renderEpicBlock renders one epic as the lines it occupies: a single truncated
+// row normally, or a wrapped multi-line block when wrap is on.
+func (m model) renderEpicBlock(id string, selected bool, width int) []string {
+	if !m.wrap {
+		return []string{m.renderRow(id, selected, width)}
+	}
+	return m.renderWrappedRow(id, selected, width)
+}
+
+// renderWrappedRow lays an epic out over as many lines as its title needs: the
+// glyph, id and priority lead the first line, and the title wraps with its
+// continuation lines (and any "needs" note) indented under it.
+func (m model) renderWrappedRow(id string, selected bool, width int) []string {
+	is := m.graph.Issues[id]
+	status := m.graph.EpicStatus[id]
+	var annotation string
+	if needs := m.graph.Prereqs[id]; len(needs) > 0 {
+		annotation = "needs " + joinShort(needs, 3)
+	}
+
+	sid := shortID(id)
+	lead := fmt.Sprintf("%s %-6s P%d  ", glyph(status), sid, is.Priority)
+	indentW := lipgloss.Width(lead)
+	indent := strings.Repeat(" ", indentW)
+	titleLines := strings.Split(lipgloss.NewStyle().Width(max(width-indentW, 4)).Render(is.Title), "\n")
+
+	if selected {
+		plainLead := fmt.Sprintf("%s %-6s P%d  ", statusMark(status), sid, is.Priority)
+		var out []string
+		for i, tl := range titleLines {
+			prefix := indent
+			if i == 0 {
+				prefix = plainLead
+			}
+			out = append(out, selectedStyle.Width(width).Render(truncate(prefix+tl, width)))
+		}
+		if annotation != "" {
+			out = append(out, selectedStyle.Width(width).Render(truncate(indent+annotation, width)))
+		}
+		return out
+	}
+
+	var out []string
+	for i, tl := range titleLines {
+		if i == 0 {
+			out = append(out, lead+tl)
+		} else {
+			out = append(out, indent+tl)
 		}
 	}
-	return b.String()
+	if annotation != "" {
+		out = append(out, indent+dimStyle.Render(annotation))
+	}
+	return out
 }
 
 // taskListContent renders the current epic's tasks in the lower-right region,
@@ -401,4 +461,37 @@ func windowStart(n, cursor, h int) int {
 		return 0
 	}
 	return min(max(cursor-h/2, 0), n-h)
+}
+
+// windowBlocks flattens the variable-height blocks that fit within rows lines,
+// always including the cursor's block and growing the window around it (downward
+// first) until no adjacent block fits.
+func windowBlocks(blocks [][]string, cursor, rows int) []string {
+	if len(blocks) == 0 {
+		return nil
+	}
+	cursor = min(max(cursor, 0), len(blocks)-1)
+	lo, hi := cursor, cursor
+	used := len(blocks[cursor])
+	for {
+		grew := false
+		if hi+1 < len(blocks) && used+len(blocks[hi+1]) <= rows {
+			hi++
+			used += len(blocks[hi])
+			grew = true
+		}
+		if lo-1 >= 0 && used+len(blocks[lo-1]) <= rows {
+			lo--
+			used += len(blocks[lo])
+			grew = true
+		}
+		if !grew {
+			break
+		}
+	}
+	var out []string
+	for i := lo; i <= hi; i++ {
+		out = append(out, blocks[i]...)
+	}
+	return out
 }

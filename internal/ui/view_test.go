@@ -170,6 +170,26 @@ func TestFocusModelSections(t *testing.T) {
 	require.False(t, m.focused)
 }
 
+// w toggles wrap-all: a long epic title that truncates by default renders across
+// multiple lines once wrap is on.
+func TestWrapEpicTitles(t *testing.T) {
+	m := testModel()
+	long := "Substrate and infrastructure with a very long descriptive title that cannot fit"
+	is := m.graph.Issues["a"]
+	is.Title = long
+	m.graph.Issues["a"] = is
+
+	// Default: truncated to a single row — the tail word is not present.
+	require.NotContains(t, m.View(), "cannot fit")
+
+	next, _ := m.handleKey(keyMsg("w"))
+	m = next.(model)
+	require.True(t, m.wrap)
+	block := m.renderEpicBlock("a", true, 40)
+	require.Greater(t, len(block), 1, "long title wraps to multiple lines")
+	require.Contains(t, m.View(), "cannot fit", "wrapped title shows its full text")
+}
+
 // Enter on a focused task opens its detail page (task fields, same motion as the
 // epic); Esc returns to the task list.
 func TestOpenTaskDetail(t *testing.T) {

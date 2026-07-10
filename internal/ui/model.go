@@ -26,6 +26,7 @@ type model struct {
 	detail  viewport.Model // epic fields region (top-right)
 
 	epicCursor int
+	wrap       bool // wrap epic titles in the list instead of truncating
 
 	focused    bool // right pane (fields + tasks) has focus
 	section    int  // which right-pane section is selected (sec* below)
@@ -241,6 +242,8 @@ func (m model) handleLeftKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "down", "j":
 		m.moveEpic(1)
 		m.syncDetail()
+	case "w":
+		m.wrap = !m.wrap
 	case "enter", "l", "right":
 		if m.currentEpic() != "" {
 			m.focused = true
