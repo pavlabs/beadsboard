@@ -712,17 +712,11 @@ func (m model) commitEdit() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	syncID := ""
-	if m.shouldSync(field) {
-		syncID = id // push this status change to GitHub once the local write lands
+	if m.cfg.GitHubSync {
+		syncID = id // push this edit to GitHub once the local write lands
 	}
 	m.loading = true
 	return m, tea.Batch(m.spinner.Tick, m.updateCmd(id, field, value, syncID))
-}
-
-// shouldSync reports whether persisting field should also push the issue to
-// GitHub. Only status changes sync, and only when the feature is enabled.
-func (m model) shouldSync(field string) bool {
-	return field == "status" && m.cfg.GitHubSync
 }
 
 func (m model) editValue() (field, value string) {

@@ -41,19 +41,6 @@ func TestBuildPromptStopAndAsk(t *testing.T) {
 	require.Contains(t, epic, "every open task")
 }
 
-// GitHub sync only rides along with status changes, and only when enabled.
-func TestShouldSyncGatesOnStatusAndConfig(t *testing.T) {
-	m := testModel()
-
-	m.cfg.GitHubSync = false
-	require.False(t, m.shouldSync("status"), "disabled: no sync")
-
-	m.cfg.GitHubSync = true
-	require.True(t, m.shouldSync("status"))
-	require.False(t, m.shouldSync("title"), "only status syncs")
-	require.False(t, m.shouldSync("priority"))
-}
-
 // Settings navigation adjusts the in-memory config without saving.
 func TestSettingsAdjust(t *testing.T) {
 	m := testModel()
