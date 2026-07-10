@@ -30,6 +30,7 @@ type model struct {
 	focused    bool // right pane (fields + tasks) has focus
 	section    int  // which right-pane section is selected (sec* below)
 	taskCursor int  // selected task when the task-list section is focused
+	taskOpen   bool // drilled into a task's detail page (reuses field motion)
 
 	editing bool            // inline editing the focused field
 	editSec int             // section being edited
@@ -53,6 +54,10 @@ const (
 	secTasks
 	sectionCount
 )
+
+// taskSectionCount is how many sections a task's detail page cycles through: the
+// same fields as an epic minus the task-list section (a task has no subtasks).
+const taskSectionCount = secTasks
 
 // editStatuses are the statuses the status field cycles through when editing.
 var editStatuses = []string{"open", "in_progress", "blocked", "closed"}
@@ -218,6 +223,9 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
+	if m.taskOpen {
+		return m.handleTaskKey(msg)
+	}
 	if m.focused {
 		return m.handleRightKey(msg)
 	}
@@ -260,15 +268,21 @@ func (m model) handleRightKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !m.loading && m.section != secTasks {
 			m.beginEdit()
 		}
+	case "enter", "l", "right":
+		if m.section == secTasks && m.currentTask() != "" {
+			m.openTask()
+		}
 	case "up", "k":
 		if m.section == secTasks {
 			m.moveTask(-1)
+			m.syncDetail() // refresh the beside-list preview for the new task
 		} else {
 			m.detail.ScrollUp(1)
 		}
 	case "down", "j":
 		if m.section == secTasks {
 			m.moveTask(1)
+			m.syncDetail()
 		} else {
 			m.detail.ScrollDown(1)
 		}
@@ -276,10 +290,50 @@ func (m model) handleRightKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// handleTaskKey drives a task's detail page, which reuses the epic's field
+// motion (title→status→priority→description→notes) but has no task-list section.
+func (m model) handleTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "h", "left":
+		m.closeTask()
+	case "tab":
+		m.section = (m.section + 1) % taskSectionCount
+		m.syncDetail()
+	case "shift+tab":
+		m.section = (m.section - 1 + taskSectionCount) % taskSectionCount
+		m.syncDetail()
+	case "e":
+		if !m.loading {
+			m.beginEdit()
+		}
+	case "up", "k":
+		m.detail.ScrollUp(1)
+	case "down", "j":
+		m.detail.ScrollDown(1)
+	}
+	return m, nil
+}
+
+// openTask drills into the highlighted task's detail page.
+func (m *model) openTask() {
+	m.taskOpen = true
+	m.section = secTitle
+	m.resizeDetail()
+	m.syncDetail()
+}
+
+// closeTask returns from a task's detail page to the epic's task list.
+func (m *model) closeTask() {
+	m.taskOpen = false
+	m.section = secTasks
+	m.resizeDetail()
+	m.syncDetail()
+}
+
 // beginEdit opens the inline editor for the focused field, primed with its
 // current value.
 func (m *model) beginEdit() {
-	id := m.currentEpic()
+	id := m.target()
 	if id == "" {
 		return
 	}
@@ -381,7 +435,7 @@ func (m *model) cancelEdit() {
 
 // commitEdit persists the edited value and reloads.
 func (m model) commitEdit() (tea.Model, tea.Cmd) {
-	id := m.currentEpic()
+	id := m.target()
 	field, value := m.editValue()
 	m.cancelEdit()
 	if id == "" || field == "" {
@@ -445,6 +499,25 @@ func (m model) currentEpic() string {
 		return ""
 	}
 	return m.graph.Epics[m.epicCursor]
+}
+
+// currentTask is the task the cursor is highlighting within the current epic, or
+// "".
+func (m model) currentTask() string {
+	tasks := m.currentEpicTasks()
+	if m.taskCursor < 0 || m.taskCursor >= len(tasks) {
+		return ""
+	}
+	return tasks[m.taskCursor]
+}
+
+// target is the issue that field navigation and editing act on: the drilled-into
+// task when a task detail page is open, otherwise the highlighted epic.
+func (m model) target() string {
+	if m.taskOpen {
+		return m.currentTask()
+	}
+	return m.currentEpic()
 }
 
 // currentEpicTasks are the tasks of the highlighted epic, in topo order.

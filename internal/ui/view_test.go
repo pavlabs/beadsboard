@@ -170,6 +170,71 @@ func TestFocusModelSections(t *testing.T) {
 	require.False(t, m.focused)
 }
 
+// Enter on a focused task opens its detail page (task fields, same motion as the
+// epic); Esc returns to the task list.
+func TestOpenTaskDetail(t *testing.T) {
+	m := testModel()
+	m.focused = true
+	m.section = secTasks
+	m.taskCursor = 0 // a.1 "design", description "the design"
+
+	next, _ := m.handleKey(keyMsg("enter"))
+	m = next.(model)
+	require.True(t, m.taskOpen)
+	require.Equal(t, secTitle, m.section)
+	require.Contains(t, m.detail.View(), "design")     // task title
+	require.Contains(t, m.detail.View(), "the design") // task description
+
+	next, _ = m.handleKey(keyMsg("esc"))
+	m = next.(model)
+	require.False(t, m.taskOpen)
+	require.Equal(t, secTasks, m.section)
+}
+
+// Editing inside a task's detail page targets the task, not the parent epic.
+func TestTaskDetailEditTargetsTask(t *testing.T) {
+	m := testModel()
+	m.focused = true
+	m.section = secTasks
+	m.taskCursor = 0
+	next, _ := m.handleKey(keyMsg("enter"))
+	m = next.(model)
+
+	next, _ = m.handleKey(keyMsg("e"))
+	m = next.(model)
+	require.True(t, m.editing)
+	require.Equal(t, "design", m.input.Value(), "edits the task title, not the epic's")
+}
+
+// Tab in a task's detail page cycles the five fields and wraps, never reaching
+// the task-list section (a task has no subtasks).
+func TestTaskDetailTabCycle(t *testing.T) {
+	m := testModel()
+	m.focused = true
+	m.section = secTasks
+	m.taskCursor = 0
+	next, _ := m.handleKey(keyMsg("enter"))
+	m = next.(model)
+	require.Equal(t, secTitle, m.section)
+
+	for _, want := range []int{secStatus, secPriority, secDescription, secNotes, secTitle} {
+		next, _ = m.handleKey(keyMsg("tab"))
+		m = next.(model)
+		require.Equal(t, want, m.section)
+		require.NotEqual(t, secTasks, m.section)
+	}
+}
+
+// With the task-list section focused, the hovered task's fields preview splits in
+// beside the list.
+func TestTaskPreviewBesideList(t *testing.T) {
+	m := testModel()
+	m.focused = true
+	m.section = secTasks
+	m.taskCursor = 0 // a.1 has description "the design"
+	require.Contains(t, m.View(), "the design", "hovered task preview renders beside the list")
+}
+
 // When the task-list section is focused, up/down move the task cursor.
 func TestTaskSectionCursor(t *testing.T) {
 	m := testModel() // epic "a" has tasks a.1, a.2

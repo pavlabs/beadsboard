@@ -30,12 +30,16 @@ func rightSplit(innerH int) (topContent, botContent int) {
 
 func (m *model) resizeDetail() {
 	_, rightOuter, innerH := m.layout()
-	topContent, _ := rightSplit(innerH)
 	m.detail.Width = max(rightOuter-4, 1) // border + padding
-	m.detail.Height = topContent
+	if m.taskOpen {
+		m.detail.Height = innerH // task detail owns the whole right pane
+	} else {
+		topContent, _ := rightSplit(innerH)
+		m.detail.Height = topContent
+	}
 	m.input.Width = max(m.detail.Width-14, 8)
 	m.area.SetWidth(max(m.detail.Width, 8))
-	m.area.SetHeight(max(topContent-4, 3))
+	m.area.SetHeight(max(m.detail.Height-4, 3))
 }
 
 func (m model) View() string {
@@ -81,8 +85,12 @@ func (m model) footerLine() string {
 		default:
 			keys = "ctrl+s save · esc cancel · enter = newline"
 		}
+	case m.taskOpen:
+		keys = "tab field · e edit · ↑/↓ scroll · esc back · q quit"
+	case m.focused && m.section == secTasks:
+		keys = "↑/↓ task · enter open · tab section · esc back · q quit"
 	case m.focused:
-		keys = "tab section · e edit · ↑/↓ scroll/move · esc back · q quit"
+		keys = "tab section · e edit · ↑/↓ scroll · esc back · q quit"
 	default:
 		keys = "↑/↓ move · → open · r refresh · q quit"
 	}
@@ -91,15 +99,49 @@ func (m model) footerLine() string {
 
 func (m model) panes() string {
 	leftOuter, rightOuter, innerH := m.layout()
-	topContent, botContent := rightSplit(innerH)
 	rightInner := max(rightOuter-4, 1)
-
 	left := boxStyle.Width(leftOuter - 2).Height(innerH).Render(m.epicsContent(leftOuter-4, innerH))
-	fields := boxStyle.Width(rightOuter - 2).Height(topContent).Render(m.detail.View())
-	tasks := boxStyle.Width(rightOuter - 2).Height(botContent).Render(m.taskListContent(rightInner, botContent))
-	right := lipgloss.JoinVertical(lipgloss.Left, fields, tasks)
+
+	var right string
+	if m.taskOpen {
+		// A task's detail page takes the whole right pane — it has no subtasks.
+		right = boxStyle.Width(rightOuter - 2).Height(innerH).Render(m.detail.View())
+	} else {
+		topContent, botContent := rightSplit(innerH)
+		fields := boxStyle.Width(rightOuter - 2).Height(topContent).Render(m.detail.View())
+		tasks := boxStyle.Width(rightOuter - 2).Height(botContent).Render(m.taskBox(rightInner, botContent))
+		right = lipgloss.JoinVertical(lipgloss.Left, fields, tasks)
+	}
 
 	return lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right)
+}
+
+// taskBox renders the lower-right region: just the task list normally, or the
+// list split beside a read-only preview of the hovered task once the task-list
+// section is focused.
+func (m model) taskBox(width, height int) string {
+	if !m.focused || m.section != secTasks {
+		return m.taskListContent(width, height)
+	}
+	listW := max(width/2, 8)
+	prevW := max(width-listW-1, 8)
+	list := m.taskListContent(listW, height)
+	preview := m.taskPreviewContent(prevW, height)
+	return lipgloss.JoinHorizontal(lipgloss.Top, list, " ", preview)
+}
+
+// taskPreviewContent renders a read-only field summary of the hovered task,
+// clipped to the region height.
+func (m model) taskPreviewContent(width, height int) string {
+	id := m.currentTask()
+	if id == "" {
+		return dimStyle.Render("no task")
+	}
+	lines := strings.Split(m.fields(id, width), "\n")
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	return strings.Join(lines, "\n")
 }
 
 // epicsContent renders the epic list (left pane) with windowed scrolling.
@@ -219,21 +261,25 @@ func (m *model) syncDetail() {
 // section. Title stays pinned at the top — moving between sections only moves
 // the highlight, never scrolls the metadata out of view.
 func (m *model) renderFields() {
-	id := m.currentEpic()
+	id := m.target()
 	if m.graph == nil || id == "" {
 		m.detail.SetContent("")
 		return
 	}
-	m.detail.SetContent(m.epicFields(id))
+	m.detail.SetContent(m.fields(id, m.detail.Width))
 }
 
-// epicFields lays out the epic's navigable fields (title/status/priority, then
+// fields lays out an issue's navigable fields (title/status/priority, then
 // read-only context, then the description and notes blocks), highlighting the
-// focused section.
-func (m model) epicFields(id string) string {
+// focused section. It serves both an epic and a drilled-into task; the context
+// rows differ by type.
+func (m model) fields(id string, width int) string {
 	is := m.graph.Issues[id]
+	width = max(width, 1)
 	st := m.graph.EpicStatus[id]
-	width := max(m.detail.Width, 1)
+	if !is.IsEpic() {
+		st = m.graph.TaskStatus[id]
+	}
 
 	var b strings.Builder
 	put := func(s string) {
@@ -280,13 +326,17 @@ func (m model) epicFields(id string) string {
 	short(secStatus, "status", statusOf(st).word, glyph(st)+" "+statusWord(st))
 	short(secPriority, "priority", fmt.Sprintf("P%d", is.Priority), fmt.Sprintf("P%d", is.Priority))
 
-	done, total := m.graph.EpicProgress(id)
-	ctx("progress", fmt.Sprintf("%d/%d done", done, total))
-	if needs := m.graph.Prereqs[id]; len(needs) > 0 {
-		ctx("needs", joinShort(needs, 99))
-	}
-	if unl := m.graph.Unlocks[id]; len(unl) > 0 {
-		ctx("unlocks", joinShort(unl, 99))
+	if is.IsEpic() {
+		done, total := m.graph.EpicProgress(id)
+		ctx("progress", fmt.Sprintf("%d/%d done", done, total))
+		if needs := m.graph.Prereqs[id]; len(needs) > 0 {
+			ctx("needs", joinShort(needs, 99))
+		}
+		if unl := m.graph.Unlocks[id]; len(unl) > 0 {
+			ctx("unlocks", joinShort(unl, 99))
+		}
+	} else if refs := m.blockerRefs(id); len(refs) > 0 {
+		ctx("needs", joinLimit(refs, 99))
 	}
 	if len(is.Labels) > 0 {
 		ctx("labels", strings.Join(is.Labels, ", "))
