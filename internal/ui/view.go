@@ -444,8 +444,8 @@ func (m model) fields(id string, width int) string {
 	} else if refs := m.blockerRefs(id); len(refs) > 0 {
 		ctx("needs", joinLimit(refs, 99))
 	}
-	if labs := userLabels(is.Labels); len(labs) > 0 {
-		ctx("labels", strings.Join(labs, ", "))
+	if len(is.Labels) > 0 {
+		ctx("labels", strings.Join(is.Labels, ", "))
 	}
 
 	block(secDescription, "description", is.Description)
@@ -538,19 +538,6 @@ func windowBlocks(blocks [][]string, cursor, rows int) []string {
 	var out []string
 	for i := lo; i <= hi; i++ {
 		out = append(out, blocks[i]...)
-	}
-	return out
-}
-
-// userLabels drops the status:* sync-plumbing labels, leaving the labels a
-// human actually set.
-func userLabels(labels []string) []string {
-	out := make([]string, 0, len(labels))
-	for _, l := range labels {
-		if strings.HasPrefix(l, beads.StatusLabelPrefix) {
-			continue
-		}
-		out = append(out, l)
 	}
 	return out
 }

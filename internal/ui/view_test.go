@@ -352,10 +352,3 @@ func TestTaskSectionCursor(t *testing.T) {
 	m = next.(model)
 	require.Equal(t, 1, m.taskCursor, "clamps at the last task")
 }
-
-// userLabels hides the status:* sync-plumbing labels but keeps human labels.
-func TestUserLabelsHidesStatusPlumbing(t *testing.T) {
-	got := userLabels([]string{"gate", "status::in_progress", "urgent"})
-	require.Equal(t, []string{"gate", "urgent"}, got)
-	require.Empty(t, userLabels([]string{"status::open"}))
-}
