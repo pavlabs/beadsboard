@@ -6,6 +6,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// GithubNumber pulls the issue number out of a gh-<n> external_ref, and yields 0
+// for anything that isn't one.
+func TestGithubNumber(t *testing.T) {
+	require.Equal(t, 42, GithubNumber("gh-42"))
+	require.Equal(t, 0, GithubNumber(""))
+	require.Equal(t, 0, GithubNumber("jira-ABC"))
+	require.Equal(t, 0, GithubNumber("gh-"))
+}
+
 // statusUpdateArgs sets the new status, adds its carrier label, and removes the
 // carrier label of every other status so exactly one remains.
 func TestStatusUpdateArgs(t *testing.T) {

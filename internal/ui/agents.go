@@ -1,51 +1,77 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/pavlabs/beadsboard/internal/agent"
+	"github.com/pavlabs/beadsboard/internal/beads"
 	"github.com/pavlabs/beadsboard/internal/config"
 )
 
 // --- agent spawning & intervention --------------------------------------------
 
-// spawnCmd launches a headless agent for the issue off the UI goroutine.
+// spawnCmd launches a headless agent for the issue off the UI goroutine. With
+// the GitHub plugin on it first ensures the bead has a linked issue (so the
+// agent's PR can close it) and passes the repo into the agent's environment.
 func (m model) spawnCmd(issueID, scope string) tea.Cmd {
-	title := ""
+	title, ref := "", ""
 	if is, ok := m.graph.Issues[issueID]; ok {
-		title = is.Title
+		title, ref = is.Title, is.ExternalRef
 	}
-	spec := agent.Spec{
-		IssueID:        issueID,
-		Scope:          scope,
-		Prompt:         buildPrompt(issueID, scope, title),
-		MaxTurns:       m.cfg.MaxTurns,
-		PermissionMode: m.cfg.PermissionMode,
-		AllowedTools:   m.cfg.AllowedTools(),
-	}
-	mgr := m.mgr
+	client, cfg, mgr := m.client, m.cfg, m.mgr
 	return func() tea.Msg {
+		var syncErr error
+		if cfg.GitHubSync {
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			syncErr = client.EnsureIssue(ctx, issueID, ref, cfg.GitHubRepository)
+			cancel()
+		}
+		spec := agent.Spec{
+			IssueID:        issueID,
+			Scope:          scope,
+			Prompt:         buildPrompt(issueID, scope, title, cfg.GitHubSync, beads.GithubNumber(ref)),
+			MaxTurns:       cfg.MaxTurns,
+			PermissionMode: cfg.PermissionMode,
+			AllowedTools:   cfg.AllowedTools(),
+		}
+		if cfg.GitHubSync {
+			spec.Repo = cfg.GitHubRepository
+		}
 		_, err := mgr.Spawn(spec)
+		if err == nil {
+			err = syncErr // surface a best-effort sync failure only if the spawn itself succeeded
+		}
 		return spawnedMsg{err: err}
 	}
 }
 
 // buildPrompt tells the agent to recall project context, do the scoped work on
 // its isolated branch, and stop-and-ask (with the marker) rather than guess.
-func buildPrompt(id, scope, title string) string {
+// When the GitHub plugin is on it also asks for a PR that closes the tracking
+// issue: by number when known, else resolved by the agent from external_ref.
+func buildPrompt(id, scope, title string, ghSync bool, issueNum int) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "Recall everything about this beads project: run `bd prime`, then `bd show %s` and read the issue in full.\n\n", id)
 	if scope == "epic" {
 		fmt.Fprintf(&sb, "Work through every open task in epic %s «%s» in dependency order. For each: implement it, run the project's checks, commit, and update its bd status. When the epic is complete, open a pull request for this branch.\n\n", id, title)
 	} else {
 		fmt.Fprintf(&sb, "Implement task %s «%s»: make the change, run the project's checks, commit on this branch, update its bd status, and open a pull request.\n\n", id, title)
+	}
+	if ghSync {
+		if issueNum > 0 {
+			fmt.Fprintf(&sb, "This work is tracked as GitHub issue #%d — include `Closes #%d` in the PR description so merging it closes the issue.\n\n", issueNum, issueNum)
+		} else {
+			fmt.Fprintf(&sb, "This work is tracked as a GitHub issue — read its number from `bd show %s` (external_ref `gh-N`) and include `Closes #N` in the PR description so merging it closes the issue.\n\n", id)
+		}
 	}
 	fmt.Fprintf(&sb, "You are on an isolated git worktree and branch, so commit and push freely. If anything is ambiguous or you get blocked, do NOT guess — stop and ask: end your final message with the marker %s followed by your question.", agent.NeedsInputMarker)
 	return sb.String()

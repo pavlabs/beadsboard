@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -40,6 +41,58 @@ func (c *Client) Sync(ctx context.Context, id, repo string) error {
 		return fmt.Errorf("bd github sync: %w: %s", err, sanitize(strings.TrimSpace(string(out))))
 	}
 	return nil
+}
+
+// Push creates or updates the GitHub issue linked to a bead via
+// `bd github push <id>`, setting its external_ref on first push.
+func (c *Client) Push(ctx context.Context, id, repo string) error {
+	cmd := exec.CommandContext(ctx, "bd", "github", "push", id)
+	cmd.Dir = c.Dir
+	cmd.Env = githubEnv(repo)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("bd github push: %w: %s", err, sanitize(strings.TrimSpace(string(out))))
+	}
+	return nil
+}
+
+// Pull refreshes a bead from its linked GitHub issue via `bd github pull <id>`.
+func (c *Client) Pull(ctx context.Context, id, repo string) error {
+	cmd := exec.CommandContext(ctx, "bd", "github", "pull", id)
+	cmd.Dir = c.Dir
+	cmd.Env = githubEnv(repo)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("bd github pull: %w: %s", err, sanitize(strings.TrimSpace(string(out))))
+	}
+	return nil
+}
+
+// EnsureIssue makes sure a bead has a linked GitHub issue before an agent starts
+// work: it pulls the latest for the configured repo, then — if the bead is still
+// unlinked (empty external_ref) — pushes to create the issue. Push is idempotent
+// on external_ref, so a pull that just linked the bead won't produce a duplicate.
+// ref is the bead's external_ref as currently known locally.
+func (c *Client) EnsureIssue(ctx context.Context, id, ref, repo string) error {
+	if err := c.Pull(ctx, id, repo); err != nil {
+		return err
+	}
+	if ref != "" {
+		return nil // already linked
+	}
+	return c.Push(ctx, id, repo)
+}
+
+// GithubNumber parses the issue number from a "gh-42" external_ref, or 0 when the
+// ref is empty or not a GitHub link.
+func GithubNumber(ref string) int {
+	suffix, ok := strings.CutPrefix(ref, "gh-")
+	if !ok {
+		return 0
+	}
+	n, err := strconv.Atoi(suffix)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // UpdateStatus persists a status change and, in the same bd write, reconciles

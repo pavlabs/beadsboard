@@ -50,6 +50,7 @@ type Spec struct {
 	MaxTurns       int // 0 = uncapped
 	PermissionMode string
 	AllowedTools   []string
+	Repo           string // GITHUB_REPOSITORY for the agent's own bd/gh, or ""
 }
 
 // View is an immutable snapshot of an agent for rendering.
@@ -192,6 +193,9 @@ func (m *Manager) Spawn(spec Spec) (View, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, m.claudeBin, claudeArgs(spec)...)
 	cmd.Dir = wt
+	if spec.Repo != "" {
+		cmd.Env = append(os.Environ(), "GITHUB_REPOSITORY="+spec.Repo)
+	}
 	cmd.Stderr = logFile
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

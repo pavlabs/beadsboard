@@ -31,14 +31,26 @@ func TestAgentsTabEmptyState(t *testing.T) {
 // The spawn prompt scopes the work and instructs the agent to stop-and-ask
 // instead of guessing.
 func TestBuildPromptStopAndAsk(t *testing.T) {
-	task := buildPrompt("bd-1", "task", "Add cache")
+	task := buildPrompt("bd-1", "task", "Add cache", false, 0)
 	require.Contains(t, task, "bd-1")
 	require.Contains(t, task, "Add cache")
 	require.Contains(t, task, agent.NeedsInputMarker)
 	require.Contains(t, task, "pull request")
+	require.NotContains(t, task, "Closes", "no closing keyword without the sync plugin")
 
-	epic := buildPrompt("ep-1", "epic", "Platform")
+	epic := buildPrompt("ep-1", "epic", "Platform", false, 0)
 	require.Contains(t, epic, "every open task")
+}
+
+// With the plugin on, the prompt asks for a PR that closes the tracking issue:
+// by number when known, otherwise resolved by the agent from external_ref.
+func TestBuildPromptClosesIssue(t *testing.T) {
+	known := buildPrompt("bd-1", "task", "Add cache", true, 42)
+	require.Contains(t, known, "Closes #42")
+
+	unknown := buildPrompt("bd-1", "task", "Add cache", true, 0)
+	require.Contains(t, unknown, "external_ref")
+	require.Contains(t, unknown, "Closes #N")
 }
 
 // Settings navigation adjusts the in-memory config without saving.
