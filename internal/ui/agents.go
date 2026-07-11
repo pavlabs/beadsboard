@@ -67,14 +67,11 @@ func (m model) spawnCmd(issueID, scope string) tea.Cmd {
 // reverse Action that relabels the issue) flows back into bd here.
 func (m model) pullStatusesCmd() tea.Cmd {
 	client, cfg := m.client, m.cfg
-	type target struct {
-		id, cur string
-		num     int
-	}
+	type target struct{ id, cur, ref string }
 	var targets []target
 	for id, is := range m.graph.Issues {
-		if n := beads.GithubNumber(is.ExternalRef); n > 0 {
-			targets = append(targets, target{id: id, cur: is.Status, num: n})
+		if is.ExternalRef != "" {
+			targets = append(targets, target{id: id, cur: is.Status, ref: is.ExternalRef})
 		}
 	}
 	return func() tea.Msg {
@@ -82,7 +79,8 @@ func (m model) pullStatusesCmd() tea.Cmd {
 		defer cancel()
 		// With a board configured, cards drive status: read the Status column so a
 		// card move flows back. Otherwise fall back to the issue's state + label.
-		var statuses map[int]string
+		// Both are keyed by the issue URL, matching a bead's external_ref.
+		var statuses map[string]string
 		var err error
 		if cfg.GitHubProjectNumber > 0 {
 			statuses, err = client.BoardStatuses(ctx, cfg.GitHubProjectOwner, cfg.GitHubProjectNumber)
@@ -94,7 +92,7 @@ func (m model) pullStatusesCmd() tea.Cmd {
 		}
 		changed := 0
 		for _, t := range targets {
-			desired, ok := statuses[t.num]
+			desired, ok := statuses[t.ref]
 			if !ok || desired == "" || desired == t.cur {
 				continue
 			}

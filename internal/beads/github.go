@@ -17,11 +17,13 @@ import (
 const statusLabelPrefix = "status::"
 
 // IssueStatuses reads each issue's status from GitHub via `gh issue list`, keyed
-// by issue number, so a pull can make GitHub authoritative over bead status. The
-// canonical value collapses the issue's open/closed state and its status::
-// carrier label into one bd status.
-func (c *Client) IssueStatuses(ctx context.Context, repo string) (map[int]string, error) {
-	args := []string{"issue", "list", "--state", "all", "--limit", "1000", "--json", "number,state,labels"}
+// by the issue's full URL (which is what a bead's external_ref stores), so a pull
+// can make GitHub authoritative over bead status. The canonical value collapses
+// the issue's open/closed state and its status:: carrier label into one bd
+// status. Keying by URL rather than number keeps it correct across repos, where
+// issue numbers collide.
+func (c *Client) IssueStatuses(ctx context.Context, repo string) (map[string]string, error) {
+	args := []string{"issue", "list", "--state", "all", "--limit", "1000", "--json", "url,state,labels"}
 	if repo != "" {
 		args = append(args, "--repo", repo)
 	}
@@ -38,7 +40,7 @@ func (c *Client) IssueStatuses(ctx context.Context, repo string) (map[int]string
 	}
 
 	var issues []struct {
-		Number int    `json:"number"`
+		URL    string `json:"url"`
 		State  string `json:"state"`
 		Labels []struct {
 			Name string `json:"name"`
@@ -48,22 +50,24 @@ func (c *Client) IssueStatuses(ctx context.Context, repo string) (map[int]string
 		return nil, fmt.Errorf("decode gh issue list: %w", err)
 	}
 
-	statuses := make(map[int]string, len(issues))
+	statuses := make(map[string]string, len(issues))
 	for _, is := range issues {
 		names := make([]string, len(is.Labels))
 		for i, l := range is.Labels {
 			names[i] = l.Name
 		}
-		statuses[is.Number] = issueStatus(is.State, names)
+		statuses[is.URL] = issueStatus(is.State, names)
 	}
 	return statuses, nil
 }
 
 // BoardStatuses reads each issue's status from a Projects v2 board's Status
-// column via `gh project item-list`, keyed by issue number, so a teammate moving
-// a card flows back into bd. Only recognised column names map to a bd status;
-// anything else (unset column, custom names) is skipped.
-func (c *Client) BoardStatuses(ctx context.Context, owner string, number int) (map[int]string, error) {
+// column via `gh project item-list`, keyed by the issue's full URL, so a
+// teammate moving a card flows back into bd. Keying by URL rather than number
+// keeps it correct for a board that aggregates issues across sub-repos, where
+// numbers collide. Only recognised column names map to a bd status; anything
+// else (unset column, custom names) is skipped.
+func (c *Client) BoardStatuses(ctx context.Context, owner string, number int) (map[string]string, error) {
 	cmd := exec.CommandContext(ctx, "gh", "project", "item-list",
 		strconv.Itoa(number), "--owner", owner, "--format", "json", "--limit", "1000")
 	cmd.Dir = c.Dir
@@ -81,8 +85,8 @@ func (c *Client) BoardStatuses(ctx context.Context, owner string, number int) (m
 		Items []struct {
 			Status  string `json:"status"`
 			Content struct {
-				Type   string `json:"type"`
-				Number int    `json:"number"`
+				Type string `json:"type"`
+				URL  string `json:"url"`
 			} `json:"content"`
 		} `json:"items"`
 	}
@@ -90,13 +94,13 @@ func (c *Client) BoardStatuses(ctx context.Context, owner string, number int) (m
 		return nil, fmt.Errorf("decode gh project item-list: %w", err)
 	}
 
-	statuses := make(map[int]string, len(res.Items))
+	statuses := make(map[string]string, len(res.Items))
 	for _, it := range res.Items {
 		if it.Content.Type != "Issue" {
 			continue
 		}
 		if s := boardStatus(it.Status); s != "" {
-			statuses[it.Content.Number] = s
+			statuses[it.Content.URL] = s
 		}
 	}
 	return statuses, nil
