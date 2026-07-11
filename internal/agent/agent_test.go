@@ -88,7 +88,10 @@ func TestSpawnDoneCapturesSessionAndCleansWorktree(t *testing.T) {
 	require.Equal(t, "sess-123", v.Session)
 	require.Equal(t, "beadsboard/epic-x-1", v.Branch)
 	require.Contains(t, strings.Join(v.Tail, " "), "→ Read")
-	require.Equal(t, 0, liveWorktrees(t, repo), "worktree removed on clean exit")
+	// finalize sets the terminal status before removing the worktree, so wait for
+	// the removal rather than racing it.
+	require.Eventually(t, func() bool { return liveWorktrees(t, repo) == 0 },
+		2*time.Second, 20*time.Millisecond, "worktree removed on clean exit")
 }
 
 // A run that ends with the marker becomes NeedsInput, keeps its question, and
@@ -129,7 +132,8 @@ func TestSpawnWorktreesFromRepoDir(t *testing.T) {
 	require.Equal(t, 0, liveWorktrees(t, root), "not in the root repo")
 
 	waitTerminal(t, m)
-	require.Equal(t, 0, liveWorktrees(t, sub), "cleaned from the sub-repo on exit")
+	require.Eventually(t, func() bool { return liveWorktrees(t, sub) == 0 },
+		2*time.Second, 20*time.Millisecond, "cleaned from the sub-repo on exit")
 }
 
 // The concurrency cap rejects spawns past the limit.
