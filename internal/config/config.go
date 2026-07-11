@@ -25,6 +25,12 @@ type Config struct {
 
 	GitHubSync       bool   `toml:"github_sync"`       // push task status changes via `bd github sync`
 	GitHubRepository string `toml:"github_repository"` // "owner/repo"; empty = use bd's own github config
+
+	// Projects v2 board for reverse status sync (G reads the Status column so a
+	// card move flows back into bd). Number 0 = board sync off; G then falls back
+	// to reading issue state + status:: labels instead.
+	GitHubProjectOwner  string `toml:"github_project_owner"`
+	GitHubProjectNumber int    `toml:"github_project_number"`
 }
 
 // Default is the configuration written on first run and used as the base that
@@ -44,8 +50,10 @@ func Default() Config {
 			"gcloud": "read",
 			"aws":    "read",
 		},
-		GitHubSync:       false,
-		GitHubRepository: "",
+		GitHubSync:          false,
+		GitHubRepository:    "",
+		GitHubProjectOwner:  "",
+		GitHubProjectNumber: 0,
 	}
 }
 

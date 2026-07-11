@@ -59,6 +59,67 @@ func (c *Client) IssueStatuses(ctx context.Context, repo string) (map[int]string
 	return statuses, nil
 }
 
+// BoardStatuses reads each issue's status from a Projects v2 board's Status
+// column via `gh project item-list`, keyed by issue number, so a teammate moving
+// a card flows back into bd. Only recognised column names map to a bd status;
+// anything else (unset column, custom names) is skipped.
+func (c *Client) BoardStatuses(ctx context.Context, owner string, number int) (map[int]string, error) {
+	cmd := exec.CommandContext(ctx, "gh", "project", "item-list",
+		strconv.Itoa(number), "--owner", owner, "--format", "json", "--limit", "1000")
+	cmd.Dir = c.Dir
+	out, err := cmd.Output()
+	if err != nil {
+		stderr := ""
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			stderr = sanitize(strings.TrimSpace(string(ee.Stderr)))
+		}
+		return nil, fmt.Errorf("gh project item-list: %w: %s", err, stderr)
+	}
+
+	var res struct {
+		Items []struct {
+			Status  string `json:"status"`
+			Content struct {
+				Type   string `json:"type"`
+				Number int    `json:"number"`
+			} `json:"content"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(out, &res); err != nil {
+		return nil, fmt.Errorf("decode gh project item-list: %w", err)
+	}
+
+	statuses := make(map[int]string, len(res.Items))
+	for _, it := range res.Items {
+		if it.Content.Type != "Issue" {
+			continue
+		}
+		if s := boardStatus(it.Status); s != "" {
+			statuses[it.Content.Number] = s
+		}
+	}
+	return statuses, nil
+}
+
+// boardStatus maps a Projects Status column name to a bd status, or "" to skip
+// (unset column or a name we don't model). Inverse of the forward Action's
+// bd-status → column mapping.
+func boardStatus(column string) string {
+	switch column {
+	case "Done":
+		return "closed"
+	case "In Progress":
+		return "in_progress"
+	case "Blocked":
+		return "blocked"
+	case "Todo":
+		return "open"
+	default:
+		return ""
+	}
+}
+
 // issueStatus collapses a GitHub issue's state and its status:: carrier label
 // into a single bd status value: a closed state wins; otherwise the
 // status::<value> label if present; otherwise "open".

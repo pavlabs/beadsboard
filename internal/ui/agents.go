@@ -60,7 +60,7 @@ func (m model) spawnCmd(issueID, scope string) tea.Cmd {
 // the on-edit push — a teammate's change on GitHub (or the board, via the
 // reverse Action that relabels the issue) flows back into bd here.
 func (m model) pullStatusesCmd() tea.Cmd {
-	client, repo := m.client, m.cfg.GitHubRepository
+	client, cfg := m.client, m.cfg
 	type target struct {
 		id, cur string
 		num     int
@@ -74,7 +74,15 @@ func (m model) pullStatusesCmd() tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		statuses, err := client.IssueStatuses(ctx, repo)
+		// With a board configured, cards drive status: read the Status column so a
+		// card move flows back. Otherwise fall back to the issue's state + label.
+		var statuses map[int]string
+		var err error
+		if cfg.GitHubProjectNumber > 0 {
+			statuses, err = client.BoardStatuses(ctx, cfg.GitHubProjectOwner, cfg.GitHubProjectNumber)
+		} else {
+			statuses, err = client.IssueStatuses(ctx, cfg.GitHubRepository)
+		}
 		if err != nil {
 			return pulledMsg{err: err}
 		}

@@ -6,6 +6,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// boardStatus maps a Projects Status column name back to a bd status, and skips
+// unmapped/unset columns.
+func TestBoardStatus(t *testing.T) {
+	require.Equal(t, "closed", boardStatus("Done"))
+	require.Equal(t, "in_progress", boardStatus("In Progress"))
+	require.Equal(t, "blocked", boardStatus("Blocked"))
+	require.Equal(t, "open", boardStatus("Todo"))
+	require.Equal(t, "", boardStatus(""))
+	require.Equal(t, "", boardStatus("Icebox"))
+}
+
 // issueStatus collapses a GitHub issue's state + status:: label into one bd
 // status: closed state wins, else the carrier label, else open.
 func TestIssueStatus(t *testing.T) {
