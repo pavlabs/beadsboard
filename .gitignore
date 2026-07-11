@@ -8,6 +8,8 @@
 
 # beads issue tracker — kept local, not committed
 /.beads/
+# beadsboard's own local config (per-repo override; no secrets — token from env)
+/.beadsboard/
 /.agents/
 /.codex/
 /.claude/
