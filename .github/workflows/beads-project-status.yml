@@ -1,0 +1,63 @@
+name: beads → project status
+
+# Maps a bead's rich status onto the Projects v2 board. bd's github sync already
+# projects status::<value> labels and open/closed state onto the issue; this
+# workflow reflects that into the board's Status column, which GitHub's no-code
+# automations cannot do (they have no "label → single-select" rule).
+#
+# Setup (until these exist the job self-skips):
+#   - repo variables BEADS_PROJECT_OWNER and BEADS_PROJECT_NUMBER
+#   - secret PROJECTS_TOKEN: a PAT with `project` scope (the built-in
+#     GITHUB_TOKEN cannot write org/user Projects v2)
+# The board just needs a single-select "Status" field; option names matched:
+# Done (closed), In Progress (status::in_progress), Blocked (status::blocked,
+# falls back to In Progress if absent), Todo (otherwise).
+
+on:
+  issues:
+    types: [opened, reopened, closed, labeled, unlabeled]
+
+concurrency:
+  group: project-status-${{ github.event.issue.number }}
+
+jobs:
+  status:
+    if: ${{ vars.BEADS_PROJECT_NUMBER != '' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
+      OWNER: ${{ vars.BEADS_PROJECT_OWNER }}
+      NUMBER: ${{ vars.BEADS_PROJECT_NUMBER }}
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      ISSUE_URL: ${{ github.event.issue.html_url }}
+      ISSUE_STATE: ${{ github.event.issue.state }}
+    steps:
+      - name: Reflect status label into board Status column
+        run: |
+          set -euo pipefail
+
+          labels=$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --json labels -q '[.labels[].name] | join(",")')
+
+          if [ "$ISSUE_STATE" = "closed" ]; then target="Done"
+          elif printf '%s' "$labels" | grep -q "status::blocked"; then target="Blocked"
+          elif printf '%s' "$labels" | grep -q "status::in_progress"; then target="In Progress"
+          else target="Todo"; fi
+
+          project_id=$(gh project view "$NUMBER" --owner "$OWNER" --format json -q '.id')
+          fields=$(gh project field-list "$NUMBER" --owner "$OWNER" --format json)
+          field_id=$(jq -r '.fields[] | select(.name=="Status") | .id' <<<"$fields")
+          option_id=$(jq -r --arg n "$target" \
+            '.fields[] | select(.name=="Status") | .options[] | select(.name==$n) | .id' <<<"$fields")
+          if [ -z "$option_id" ] || [ "$option_id" = "null" ]; then
+            option_id=$(jq -r \
+              '.fields[] | select(.name=="Status") | .options[] | select(.name=="In Progress") | .id' <<<"$fields")
+          fi
+
+          gh project item-add "$NUMBER" --owner "$OWNER" --url "$ISSUE_URL" >/dev/null 2>&1 || true
+          item_id=$(gh project item-list "$NUMBER" --owner "$OWNER" --format json --limit 200 \
+            | jq -r --argjson n "$ISSUE_NUMBER" '.items[] | select(.content.number==$n) | .id')
+
+          gh project item-edit --id "$item_id" --project-id "$project_id" \
+            --field-id "$field_id" --single-select-option-id "$option_id"
+          echo "issue #$ISSUE_NUMBER → $target"
