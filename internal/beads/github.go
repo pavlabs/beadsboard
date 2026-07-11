@@ -11,10 +11,11 @@ import (
 
 // StatusLabelPrefix marks the label that carries a bead's rich status onto its
 // GitHub issue. GitHub issues model only open/closed, so in_progress/blocked
-// ride as a status:<value> label that a Projects workflow can map to a board
-// column. The prefix is also how the UI recognizes these as sync plumbing
+// ride as a status::<value> label that a Projects workflow can map to a board
+// column. The key::value form matches bd's own derived labels (type::task,
+// priority::critical), and is how the UI recognizes these as sync plumbing
 // rather than user labels.
-const StatusLabelPrefix = "status:"
+const StatusLabelPrefix = "status::"
 
 // statusLabel is the carrier label for a given status value.
 func statusLabel(status string) string { return StatusLabelPrefix + status }
@@ -81,14 +82,19 @@ func (c *Client) EnsureIssue(ctx context.Context, id, ref, repo string) error {
 	return c.Push(ctx, id, repo)
 }
 
-// GithubNumber parses the issue number from a "gh-42" external_ref, or 0 when the
-// ref is empty or not a GitHub link.
+// GithubNumber parses the issue number from a bead's external_ref, or 0 when the
+// ref is empty or not a GitHub link. bd stores the full issue URL
+// (https://github.com/owner/repo/issues/42); a bare gh-42 form is also accepted.
 func GithubNumber(ref string) int {
-	suffix, ok := strings.CutPrefix(ref, "gh-")
-	if !ok {
+	if ref == "" {
 		return 0
 	}
-	n, err := strconv.Atoi(suffix)
+	tail := ref
+	if i := strings.LastIndex(tail, "/"); i >= 0 {
+		tail = tail[i+1:] // trailing path segment of the issue URL
+	}
+	tail = strings.TrimPrefix(tail, "gh-")
+	n, err := strconv.Atoi(tail)
 	if err != nil {
 		return 0
 	}
