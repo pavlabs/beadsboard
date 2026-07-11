@@ -37,12 +37,40 @@ beadsboard --version
 Enable `github_sync` in the config and beadsboard keeps bd, GitHub issues, and a
 Projects board in step:
 
-- Status/field edits push to the linked issue via `bd github sync`; spawning an agent
-  first ensures a tracking issue exists and asks the agent's PR to `Closes #N`.
+- Any bead change beadsboard picks up — a TUI edit or a `bd` write on the CLI — is
+  pushed to its issue on the next reload; spawning an agent first ensures a tracking
+  issue exists and asks the agent's PR to `Closes #N`.
+- The bd epic→task hierarchy is mirrored as native GitHub **sub-issues**.
 - A bundled workflow (`.github/workflows/beads-project-status.yml`) reflects each
   issue's status onto the Projects board's Status column.
 - **`G`** pulls the other way — reads the board (or issue state + `status::` labels)
   and reconciles bead status, so a teammate moving a card flows back into bd.
+
+## Use cases
+
+**Single repo (the default).** Beads live in the repo you're working on
+(`beadsboard --source .`), `github_sync` targets that one repo, and agents worktree
+it. Status flows bd ↔ issues ↔ one board; a task's issue and the agent's PR are in
+the same repo so `Closes #N` auto-closes. Nothing extra to configure beyond the
+`github_*` keys below.
+
+**Meta-repo.** A root repo holds only the beads (`.beads/`) and planning; the actual
+projects are independent git repos underneath (`web/`, `api/`, …). Point beadsboard
+at the root (`--source <root>`) and tag each epic with a `repo::<name>` label (the
+value is the subdir name; tasks inherit it). Then:
+
+- an agent for that bead worktrees `<root>/<name>` and runs there, with its `bd`
+  pointed back at the root beads (`bd -C <root>`);
+- the bead's issue is created in that sub-repo's GitHub repo (derived from its
+  `origin` remote), so the agent's PR and the issue are co-located and `Closes #N`
+  works;
+- one Projects board aggregates issues across all the sub-repos, and `G` reconciles
+  board/issue status back into the root beads (matched by issue URL, since numbers
+  collide across repos).
+
+Beads with no `repo::` label fall back to single-repo behavior, so the two modes
+coexist. Setup — sub-repo remotes, the board, and deploying the status workflow per
+sub-repo — is in [docs/meta-repo.md](docs/meta-repo.md).
 
 ## Install
 
