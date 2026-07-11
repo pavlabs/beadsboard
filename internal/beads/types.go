@@ -13,6 +13,7 @@ type Issue struct {
 	Labels       []string `json:"labels"`
 	Dependencies []Dep    `json:"dependencies"`
 	UpdatedAt    string   `json:"updated_at"`
+	ExternalRef  string   `json:"external_ref"` // cross-system link, e.g. "gh-42"; set once synced
 }
 
 // Dep is one dependency edge: this issue depends on DependsOnID. Type is

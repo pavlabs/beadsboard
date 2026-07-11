@@ -216,10 +216,19 @@ func (m model) startReload() (tea.Model, tea.Cmd) {
 // GitHub once the local write lands.
 func (m model) updateCmd(id, field, value, syncID string) tea.Cmd {
 	client := m.client
+	// With the sync plugin on, a status change also reconciles the status:<value>
+	// carrier label so it can ride to GitHub; otherwise the repo stays label-free.
+	mirrorStatus := field == "status" && m.cfg.GitHubSync
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		return editSavedMsg{err: client.Update(ctx, id, field, value), syncID: syncID}
+		var err error
+		if mirrorStatus {
+			err = client.UpdateStatus(ctx, id, value, editStatuses)
+		} else {
+			err = client.Update(ctx, id, field, value)
+		}
+		return editSavedMsg{err: err, syncID: syncID}
 	}
 }
 
