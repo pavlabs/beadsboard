@@ -205,6 +205,104 @@ func (c *Client) EnsureIssue(ctx context.Context, id, ref, repo string) error {
 	return c.Push(ctx, id, repo)
 }
 
+// LinkSubIssues makes each task issue a sub-issue of the epic issue on GitHub,
+// mirroring the bd epic→task hierarchy so the correlation is visible. It queries
+// the epic's current sub-issues and adds only the missing ones, skips any task
+// not in the epic's repo (GitHub sub-issues are same-repo), and is best-effort:
+// a per-task failure is skipped, not fatal. epicRef and taskRefs are the beads'
+// external_ref issue URLs.
+// It returns the task refs that are linked after the call (already-linked plus
+// newly added), so the caller can stop re-attempting them.
+func (c *Client) LinkSubIssues(ctx context.Context, epicRef string, taskRefs []string) ([]string, error) {
+	repo, epicNum := parseIssueURL(epicRef)
+	if repo == "" {
+		return nil, nil
+	}
+	linked, err := c.subIssueURLs(ctx, repo, epicNum)
+	if err != nil {
+		return nil, err
+	}
+	var done []string
+	for _, tr := range taskRefs {
+		if linked[tr] {
+			done = append(done, tr)
+			continue
+		}
+		tRepo, tNum := parseIssueURL(tr)
+		if tRepo != repo || tNum == 0 {
+			continue
+		}
+		id, err := c.issueID(ctx, repo, tNum)
+		if err != nil {
+			continue
+		}
+		if _, err := c.ghAPI(ctx, "--method", "POST",
+			fmt.Sprintf("repos/%s/issues/%d/sub_issues", repo, epicNum),
+			"-F", "sub_issue_id="+strconv.FormatInt(id, 10)); err == nil {
+			done = append(done, tr)
+		}
+	}
+	return done, nil
+}
+
+// subIssueURLs returns the set of issue URLs already linked as sub-issues of the
+// given issue.
+func (c *Client) subIssueURLs(ctx context.Context, repo string, num int) (map[string]bool, error) {
+	out, err := c.ghAPI(ctx, fmt.Sprintf("repos/%s/issues/%d/sub_issues", repo, num), "--jq", ".[].html_url")
+	if err != nil {
+		return nil, err
+	}
+	set := map[string]bool{}
+	for _, u := range strings.Fields(string(out)) {
+		set[u] = true
+	}
+	return set, nil
+}
+
+// issueID resolves an issue number to its GitHub database id (what the sub-issue
+// endpoint keys on).
+func (c *Client) issueID(ctx context.Context, repo string, num int) (int64, error) {
+	out, err := c.ghAPI(ctx, fmt.Sprintf("repos/%s/issues/%d", repo, num), "--jq", ".id")
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+}
+
+// ghAPI runs `gh api` in the client's dir and returns stdout.
+func (c *Client) ghAPI(ctx context.Context, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "gh", append([]string{"api"}, args...)...)
+	cmd.Dir = c.Dir
+	out, err := cmd.Output()
+	if err != nil {
+		stderr := ""
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			stderr = sanitize(strings.TrimSpace(string(ee.Stderr)))
+		}
+		return nil, fmt.Errorf("gh api: %w: %s", err, stderr)
+	}
+	return out, nil
+}
+
+// parseIssueURL splits a GitHub issue URL into "owner/repo" and its number, or
+// ("", 0) if it isn't one.
+func parseIssueURL(url string) (string, int) {
+	_, after, ok := strings.Cut(url, "github.com/")
+	if !ok {
+		return "", 0
+	}
+	parts := strings.Split(after, "/")
+	if len(parts) < 4 || parts[2] != "issues" {
+		return "", 0
+	}
+	n, err := strconv.Atoi(parts[3])
+	if err != nil {
+		return "", 0
+	}
+	return parts[0] + "/" + parts[1], n
+}
+
 // GithubNumber parses the issue number from a bead's external_ref, or 0 when the
 // ref is empty or not a GitHub link. bd stores the full issue URL
 // (https://github.com/owner/repo/issues/42); a bare gh-42 form is also accepted.

@@ -65,6 +65,8 @@ type model struct {
 	fp    uint64
 	hasFP bool
 
+	subLinked map[string]bool // task issue URLs already linked as GitHub sub-issues
+
 	width, height int
 }
 
@@ -122,6 +124,10 @@ type (
 		changed int
 		err     error
 	}
+	linkedMsg struct {
+		refs []string // task issue URLs confirmed linked as sub-issues
+		err  error
+	}
 )
 
 // newInputs builds the title and description/notes editors with their shared
@@ -162,6 +168,7 @@ func New(dir string) model {
 		cfgPath:    cfgPath,
 		cfgModTime: modTime,
 		mgr:        mgr,
+		subLinked:  map[string]bool{},
 	}
 }
 
@@ -240,6 +247,50 @@ func (m model) pushGroupsCmd() tea.Cmd {
 		}
 		fp, _ := beads.Fingerprint(dir)
 		return pushedMsg{fp: fp}
+	}
+}
+
+// linkSubIssuesCmd mirrors the bd epic→task hierarchy on GitHub as native
+// sub-issues, so the correlation is visible there. It only considers tasks not
+// already confirmed linked this session, and epics/tasks that both have a synced
+// issue; an epic whose tasks are all linked contributes no work (no API call).
+func (m model) linkSubIssuesCmd() tea.Cmd {
+	client := m.client
+	type work struct {
+		epicRef  string
+		taskRefs []string
+	}
+	var jobs []work
+	for _, epicID := range m.graph.Epics {
+		epicRef := m.graph.Issues[epicID].ExternalRef
+		if epicRef == "" {
+			continue
+		}
+		var taskRefs []string
+		for _, taskID := range m.graph.Tasks[epicID] {
+			if r := m.graph.Issues[taskID].ExternalRef; r != "" && !m.subLinked[r] {
+				taskRefs = append(taskRefs, r)
+			}
+		}
+		if len(taskRefs) > 0 {
+			jobs = append(jobs, work{epicRef, taskRefs})
+		}
+	}
+	if len(jobs) == 0 {
+		return nil
+	}
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		var linked []string
+		for _, j := range jobs {
+			done, err := client.LinkSubIssues(ctx, j.epicRef, j.taskRefs)
+			if err != nil {
+				return linkedMsg{refs: linked, err: err}
+			}
+			linked = append(linked, done...)
+		}
+		return linkedMsg{refs: linked}
 	}
 }
 
@@ -333,6 +384,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.fp != 0 {
 			m.fp = msg.fp // absorb the push's own writes so it doesn't self-trigger
+		}
+		return m, m.linkSubIssuesCmd() // mirror the epic→task hierarchy as sub-issues
+
+	case linkedMsg:
+		for _, ref := range msg.refs {
+			m.subLinked[ref] = true
+		}
+		if msg.err != nil {
+			m.notice = msg.err.Error()
 		}
 		return m, nil
 

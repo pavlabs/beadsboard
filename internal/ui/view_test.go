@@ -46,6 +46,7 @@ func testModel() model {
 	m := model{client: beads.NewClient("testdir"), graph: beads.BuildGraph(issues), detail: viewport.New(0, 0)}
 	m.cfg = config.Default()
 	m.mgr = agent.New("testdir", "claude", m.cfg.MaxAgents)
+	m.subLinked = map[string]bool{}
 	m.input, m.area, m.search = newInputs()
 	m.width, m.height = 120, 30
 	m.resizeDetail()
