@@ -116,6 +116,9 @@ func (m model) footerLine() string {
 		keys = "tab section · e edit · ↑/↓ scroll · esc back · q quit"
 	default:
 		keys = "↑/↓ move · → open · / search · w wrap · r refresh · q quit"
+		if m.cfg.GitHubSync {
+			keys += " · G github-pull"
+		}
 	}
 	return dimStyle.Render("  " + keys)
 }

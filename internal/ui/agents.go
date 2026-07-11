@@ -54,6 +54,45 @@ func (m model) spawnCmd(issueID, scope string) tea.Cmd {
 	}
 }
 
+// pullStatusesCmd makes GitHub authoritative over local bead status: it reads
+// each linked issue's status (open/closed state + status:: label) and applies
+// any that differs via `bd update`, off the UI goroutine. This is the reverse of
+// the on-edit push — a teammate's change on GitHub (or the board, via the
+// reverse Action that relabels the issue) flows back into bd here.
+func (m model) pullStatusesCmd() tea.Cmd {
+	client, repo := m.client, m.cfg.GitHubRepository
+	type target struct {
+		id, cur string
+		num     int
+	}
+	var targets []target
+	for id, is := range m.graph.Issues {
+		if n := beads.GithubNumber(is.ExternalRef); n > 0 {
+			targets = append(targets, target{id: id, cur: is.Status, num: n})
+		}
+	}
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		statuses, err := client.IssueStatuses(ctx, repo)
+		if err != nil {
+			return pulledMsg{err: err}
+		}
+		changed := 0
+		for _, t := range targets {
+			desired, ok := statuses[t.num]
+			if !ok || desired == "" || desired == t.cur {
+				continue
+			}
+			if err := client.Update(ctx, t.id, "status", desired); err != nil {
+				return pulledMsg{err: err}
+			}
+			changed++
+		}
+		return pulledMsg{changed: changed}
+	}
+}
+
 // buildPrompt tells the agent to recall project context, do the scoped work on
 // its isolated branch, and stop-and-ask (with the marker) rather than guess.
 // When the GitHub plugin is on it also asks for a PR that closes the tracking

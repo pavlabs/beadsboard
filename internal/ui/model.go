@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"sort"
 	"strconv"
@@ -117,6 +118,10 @@ type (
 	spawnedMsg    struct{ err error }
 	interveneMsg  struct{ err error }
 	syncedMsg     struct{ err error }
+	pulledMsg     struct {
+		changed int
+		err     error
+	}
 )
 
 // newInputs builds the title and description/notes editors with their shared
@@ -310,6 +315,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case pulledMsg:
+		if msg.err != nil {
+			m.notice = msg.err.Error()
+			return m, nil
+		}
+		if msg.changed > 0 {
+			m.notice = fmt.Sprintf("pulled %d status change(s) from GitHub", msg.changed)
+			return m.startReload()
+		}
+		m.notice = "in sync with GitHub"
+		return m, nil
+
 	case spinner.TickMsg:
 		if !m.loading {
 			return m, nil
@@ -383,6 +400,11 @@ func (m model) handleLeftKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.clampAgentCursor()
 	case "S":
 		m.openSettings()
+	case "G":
+		if m.cfg.GitHubSync {
+			m.notice = "pulling status from GitHub…"
+			return m, m.pullStatusesCmd()
+		}
 	case "enter", "l", "right":
 		if m.currentEpic() != "" {
 			m.clearSearch()
