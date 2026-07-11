@@ -112,12 +112,13 @@ type (
 	}
 	editSavedMsg struct {
 		err    error
-		syncID string // issue to push to GitHub after this save, or "" for none
+		syncID string // issue to push to GitHub right after this save, or ""
 	}
 	agentEventMsg struct{}
 	spawnedMsg    struct{ err error }
 	interveneMsg  struct{ err error }
-	syncedMsg     struct{ err error }
+	syncedMsg     struct{ err error } // per-edit targeted push result
+	pushedMsg     struct{ err error } // push-all-on-refresh result
 	pulledMsg     struct {
 		changed int
 		err     error
@@ -166,9 +167,10 @@ func New(dir string) model {
 }
 
 func (m model) Init() tea.Cmd {
-	// The post-load fingerprint from hydrateCmd seeds the watcher baseline, so
-	// no independent fpCmd here.
-	return tea.Batch(m.spinner.Tick, m.hydrateCmd(), tickCmd(), m.waitAgentEvent())
+	// loadCmd ends in a hydrate whose post-load fingerprint seeds the watcher
+	// baseline, so no independent fpCmd here; with sync on it also pushes any
+	// beads created/changed on the CLI before launch.
+	return tea.Batch(m.spinner.Tick, m.loadCmd(), tickCmd(), m.waitAgentEvent())
 }
 
 // waitAgentEvent blocks on the manager's event channel and re-arms itself, so
@@ -214,6 +216,34 @@ func tickCmd() tea.Cmd {
 func (m model) startReload() (tea.Model, tea.Cmd) {
 	m.loading = true
 	return m, tea.Batch(m.spinner.Tick, m.hydrateCmd())
+}
+
+// reloadSyncing reloads and, when the sync plugin is on, first pushes any beads
+// changed outside beadsboard (a `bd create`/edit on the CLI that the watcher
+// just picked up) up to GitHub. hydrate runs after the push so its fingerprint
+// baseline absorbs the push's own writes and the watcher doesn't loop.
+func (m model) reloadSyncing() (tea.Model, tea.Cmd) {
+	m.loading = true
+	return m, tea.Batch(m.spinner.Tick, m.loadCmd())
+}
+
+// loadCmd reloads the graph, pushing changed beads up first when sync is on.
+func (m model) loadCmd() tea.Cmd {
+	if m.cfg.GitHubSync {
+		return tea.Sequence(m.pushAllCmd(), m.hydrateCmd())
+	}
+	return m.hydrateCmd()
+}
+
+// pushAllCmd pushes every changed bead to GitHub off the UI goroutine; bd only
+// sends what differs from the last sync, so an unchanged graph is a no-op.
+func (m model) pushAllCmd() tea.Cmd {
+	client, repo := m.client, m.cfg.GitHubRepository
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		return pushedMsg{err: client.PushAll(ctx, repo)}
+	}
 }
 
 // updateCmd persists a field edit via `bd update` off the UI goroutine. syncID,
@@ -293,7 +323,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.fp != m.fp {
-			return m.startReload()
+			return m.reloadSyncing() // external write: push it up, then reload
 		}
 		return m, nil
 
@@ -310,6 +340,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return reloaded, cmd
 
 	case syncedMsg:
+		if msg.err != nil {
+			m.notice = msg.err.Error()
+		}
+		return m, nil
+
+	case pushedMsg:
 		if msg.err != nil {
 			m.notice = msg.err.Error()
 		}

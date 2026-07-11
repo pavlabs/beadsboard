@@ -159,6 +159,20 @@ func (c *Client) Sync(ctx context.Context, id, repo string) error {
 	return nil
 }
 
+// PushAll pushes every changed bead to GitHub via `bd github sync --push-only`
+// (bd only sends what differs from the last sync). Used to keep GitHub in step
+// with bead writes that originate outside beadsboard — e.g. `bd create` on the
+// CLI, which beadsboard picks up on reload.
+func (c *Client) PushAll(ctx context.Context, repo string) error {
+	cmd := exec.CommandContext(ctx, "bd", "github", "sync", "--push-only")
+	cmd.Dir = c.Dir
+	cmd.Env = githubEnv(repo)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("bd github sync: %w: %s", err, sanitize(strings.TrimSpace(string(out))))
+	}
+	return nil
+}
+
 // Push creates or updates the GitHub issue linked to a bead via
 // `bd github push <id>`, setting its external_ref on first push.
 func (c *Client) Push(ctx context.Context, id, repo string) error {
