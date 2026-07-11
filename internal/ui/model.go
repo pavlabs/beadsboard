@@ -110,16 +110,15 @@ type (
 		fp  uint64
 		err error
 	}
-	editSavedMsg struct {
-		err    error
-		syncID string // issue to push to GitHub right after this save, or ""
-	}
+	editSavedMsg  struct{ err error }
 	agentEventMsg struct{}
 	spawnedMsg    struct{ err error }
 	interveneMsg  struct{ err error }
-	syncedMsg     struct{ err error } // per-edit targeted push result
-	pushedMsg     struct{ err error } // push-all-on-refresh result
-	pulledMsg     struct {
+	pushedMsg     struct {
+		fp  uint64 // fingerprint after the push, to re-baseline and not self-trigger
+		err error
+	}
+	pulledMsg struct {
 		changed int
 		err     error
 	}
@@ -167,10 +166,9 @@ func New(dir string) model {
 }
 
 func (m model) Init() tea.Cmd {
-	// loadCmd ends in a hydrate whose post-load fingerprint seeds the watcher
-	// baseline, so no independent fpCmd here; with sync on it also pushes any
-	// beads created/changed on the CLI before launch.
-	return tea.Batch(m.spinner.Tick, m.loadCmd(), tickCmd(), m.waitAgentEvent())
+	// The post-load fingerprint from hydrateCmd seeds the watcher baseline, so no
+	// independent fpCmd here; the hydrate handler kicks off the GitHub push.
+	return tea.Batch(m.spinner.Tick, m.hydrateCmd(), tickCmd(), m.waitAgentEvent())
 }
 
 // waitAgentEvent blocks on the manager's event channel and re-arms itself, so
@@ -218,55 +216,41 @@ func (m model) startReload() (tea.Model, tea.Cmd) {
 	return m, tea.Batch(m.spinner.Tick, m.hydrateCmd())
 }
 
-// reloadSyncing reloads and, when the sync plugin is on, first pushes any beads
-// changed outside beadsboard (a `bd create`/edit on the CLI that the watcher
-// just picked up) up to GitHub. hydrate runs after the push so its fingerprint
-// baseline absorbs the push's own writes and the watcher doesn't loop.
-func (m model) reloadSyncing() (tea.Model, tea.Cmd) {
-	m.loading = true
-	return m, tea.Batch(m.spinner.Tick, m.loadCmd())
-}
-
-// loadCmd reloads the graph, pushing changed beads up first when sync is on.
-func (m model) loadCmd() tea.Cmd {
-	if m.cfg.GitHubSync {
-		return tea.Sequence(m.pushAllCmd(), m.hydrateCmd())
+// pushGroupsCmd pushes every bead to its GitHub repo after a load, grouped by
+// the repo its repo:: label resolves to (all beads share the default repo in a
+// single-repo project). Runs after hydrate so it can group from the fresh graph;
+// the caller holds the loading flag until pushedMsg so the watcher can't fire a
+// concurrent push. It re-baselines the fingerprint to the post-push state so its
+// own writes don't trigger another reload.
+func (m model) pushGroupsCmd() tea.Cmd {
+	client, cfg, dir := m.client, m.cfg, m.client.Dir
+	groups := map[string][]string{}
+	for id, is := range m.graph.Issues {
+		if repo := client.RepoFor(is.Labels, cfg.GitHubRepository).GitHub; repo != "" {
+			groups[repo] = append(groups[repo], id)
+		}
 	}
-	return m.hydrateCmd()
-}
-
-// pushAllCmd pushes every changed bead to GitHub off the UI goroutine; bd only
-// sends what differs from the last sync, so an unchanged graph is a no-op.
-func (m model) pushAllCmd() tea.Cmd {
-	client, repo := m.client, m.cfg.GitHubRepository
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
-		return pushedMsg{err: client.PushAll(ctx, repo)}
+		for repo, ids := range groups {
+			if err := client.SyncIssues(ctx, ids, repo); err != nil {
+				return pushedMsg{err: err}
+			}
+		}
+		fp, _ := beads.Fingerprint(dir)
+		return pushedMsg{fp: fp}
 	}
 }
 
-// updateCmd persists a field edit via `bd update` off the UI goroutine. syncID,
-// when set, rides back on the result so the save handler can push that issue to
-// GitHub once the local write lands.
-func (m model) updateCmd(id, field, value, syncID string) tea.Cmd {
+// updateCmd persists a field edit via `bd update` off the UI goroutine; the
+// subsequent reload pushes the change to GitHub via pushGroupsCmd.
+func (m model) updateCmd(id, field, value string) tea.Cmd {
 	client := m.client
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		return editSavedMsg{err: client.Update(ctx, id, field, value), syncID: syncID}
-	}
-}
-
-// githubSyncCmd pushes a single issue's current state to GitHub off the UI
-// goroutine. It runs concurrently with the reload so a slow API call never
-// blocks the interface.
-func (m model) githubSyncCmd(id string) tea.Cmd {
-	client, repo := m.client, m.cfg.GitHubRepository
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-		return syncedMsg{err: client.Sync(ctx, id, repo)}
+		return editSavedMsg{err: client.Update(ctx, id, field, value)}
 	}
 }
 
@@ -282,8 +266,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 
 	case hydratedMsg:
-		m.loading = false
 		if msg.err != nil {
+			m.loading = false
 			m.err = msg.err
 			return m, nil
 		}
@@ -292,6 +276,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.fp, m.hasFP = msg.fp, true // baseline absorbs our own export's churn
 		m.clampCursors()
 		m.syncDetail()
+		if m.cfg.GitHubSync {
+			// Push changed beads to their repos; hold loading so the watcher can't
+			// fire a concurrent push mid-sync. pushedMsg clears loading.
+			return m, m.pushGroupsCmd()
+		}
+		m.loading = false
 		return m, nil
 
 	case tickMsg:
@@ -323,7 +313,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.fp != m.fp {
-			return m.reloadSyncing() // external write: push it up, then reload
+			return m.startReload() // external write: reload, then hydrate pushes it up
 		}
 		return m, nil
 
@@ -333,21 +323,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = msg.err
 			return m, nil
 		}
-		reloaded, cmd := m.startReload() // reflect the saved change immediately
-		if msg.syncID != "" {
-			return reloaded, tea.Batch(cmd, m.githubSyncCmd(msg.syncID))
-		}
-		return reloaded, cmd
-
-	case syncedMsg:
-		if msg.err != nil {
-			m.notice = msg.err.Error()
-		}
-		return m, nil
+		return m.startReload() // reflect the saved change; hydrate then pushes it up
 
 	case pushedMsg:
+		m.loading = false // held since hydratedMsg while the push ran
 		if msg.err != nil {
 			m.notice = msg.err.Error()
+			return m, nil
+		}
+		if msg.fp != 0 {
+			m.fp = msg.fp // absorb the push's own writes so it doesn't self-trigger
 		}
 		return m, nil
 
@@ -769,12 +754,8 @@ func (m model) commitEdit() (tea.Model, tea.Cmd) {
 	if id == "" || field == "" {
 		return m, nil
 	}
-	syncID := ""
-	if m.cfg.GitHubSync {
-		syncID = id // push this edit to GitHub once the local write lands
-	}
 	m.loading = true
-	return m, tea.Batch(m.spinner.Tick, m.updateCmd(id, field, value, syncID))
+	return m, tea.Batch(m.spinner.Tick, m.updateCmd(id, field, value))
 }
 
 func (m model) editValue() (field, value string) {

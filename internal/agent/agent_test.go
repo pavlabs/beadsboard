@@ -115,6 +115,23 @@ func TestSpawnNeedsInputKeepsWorktree(t *testing.T) {
 	require.Equal(t, 0, liveWorktrees(t, repo), "dismiss cleans the worktree")
 }
 
+// With Spec.RepoDir set, the worktree is cut from that sub-repo, not the
+// manager's root — the meta-repo routing.
+func TestSpawnWorktreesFromRepoDir(t *testing.T) {
+	root := gitRepo(t)
+	sub := gitRepo(t)
+	bin := stubClaude(t, `{"type":"result","result":"done"}`)
+	m := newAt(root, bin, 10, t.TempDir())
+
+	_, err := m.Spawn(Spec{IssueID: "web-1", Prompt: "go", PermissionMode: "acceptEdits", RepoDir: sub})
+	require.NoError(t, err)
+	require.Equal(t, 1, liveWorktrees(t, sub), "worktree lives in the sub-repo")
+	require.Equal(t, 0, liveWorktrees(t, root), "not in the root repo")
+
+	waitTerminal(t, m)
+	require.Equal(t, 0, liveWorktrees(t, sub), "cleaned from the sub-repo on exit")
+}
+
 // The concurrency cap rejects spawns past the limit.
 func TestSpawnRespectsMaxAgents(t *testing.T) {
 	repo := gitRepo(t)

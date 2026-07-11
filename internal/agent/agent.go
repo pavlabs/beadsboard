@@ -51,6 +51,7 @@ type Spec struct {
 	PermissionMode string
 	AllowedTools   []string
 	Repo           string // GITHUB_REPOSITORY for the agent's own bd/gh, or ""
+	RepoDir        string // git repo to worktree from; "" = the manager's root repo
 }
 
 // View is an immutable snapshot of an agent for rendering.
@@ -71,6 +72,7 @@ type View struct {
 type agent struct {
 	View
 	worktree        string
+	repoDir         string // the git repo its worktree was cut from
 	cmd             *exec.Cmd
 	cancel          context.CancelFunc
 	tail            []string
@@ -177,16 +179,22 @@ func (m *Manager) Spawn(spec Spec) (View, error) {
 	id := fmt.Sprintf("%s-%d", shortIssue(spec.IssueID), m.seq)
 	m.mu.Unlock()
 
+	// The worktree is cut from the bead's sub-repo when routed there, else the
+	// manager's root repo — the single-repo default.
+	srcRepo := spec.RepoDir
+	if srcRepo == "" {
+		srcRepo = m.repoDir
+	}
 	wt := filepath.Join(m.wtDir, id)
 	branch := "beadsboard/" + id
-	if err := m.addWorktree(branch, wt); err != nil {
+	if err := m.addWorktree(srcRepo, branch, wt); err != nil {
 		return View{}, err
 	}
 
 	logPath := filepath.Join(m.logDir, id+".jsonl")
 	logFile, err := os.Create(logPath)
 	if err != nil {
-		m.removeWorktree(wt)
+		m.removeWorktree(srcRepo, wt)
 		return View{}, fmt.Errorf("create log: %w", err)
 	}
 
@@ -201,13 +209,13 @@ func (m *Manager) Spawn(spec Spec) (View, error) {
 	if err != nil {
 		cancel()
 		_ = logFile.Close()
-		m.cleanupSpawn(logPath, wt)
+		m.cleanupSpawn(srcRepo, logPath, wt)
 		return View{}, fmt.Errorf("stdout pipe: %w", err)
 	}
 	if err := cmd.Start(); err != nil {
 		cancel()
 		_ = logFile.Close()
-		m.cleanupSpawn(logPath, wt)
+		m.cleanupSpawn(srcRepo, logPath, wt)
 		return View{}, fmt.Errorf("start claude: %w", err)
 	}
 
@@ -216,7 +224,7 @@ func (m *Manager) Spawn(spec Spec) (View, error) {
 			ID: id, IssueID: spec.IssueID, Scope: spec.Scope,
 			Status: Running, Branch: branch, Started: time.Now(),
 		},
-		worktree: wt, cmd: cmd, cancel: cancel, worktreePresent: true,
+		worktree: wt, repoDir: srcRepo, cmd: cmd, cancel: cancel, worktreePresent: true,
 	}
 	m.mu.Lock()
 	m.agents = append(m.agents, a)
@@ -228,9 +236,9 @@ func (m *Manager) Spawn(spec Spec) (View, error) {
 	return view, nil
 }
 
-func (m *Manager) cleanupSpawn(logPath, wt string) {
+func (m *Manager) cleanupSpawn(repoDir, logPath, wt string) {
 	_ = os.Remove(logPath)
-	m.removeWorktree(wt)
+	m.removeWorktree(repoDir, wt)
 }
 
 func (m *Manager) run(a *agent, stdout io.Reader, logFile *os.File, logPath string) {
@@ -297,12 +305,12 @@ func (m *Manager) finalize(a *agent, waitErr error, logPath string) {
 	if !keep {
 		a.worktreePresent = false
 	}
-	wt := a.worktree
+	wt, repoDir := a.worktree, a.repoDir
 	m.mu.Unlock()
 
 	_ = os.Remove(logPath) // logs are ephemeral; the question/outcome is kept in memory
 	if !keep {
-		m.removeWorktree(wt)
+		m.removeWorktree(repoDir, wt)
 	}
 	m.ping()
 }
@@ -358,11 +366,11 @@ func (m *Manager) Dismiss(id string) {
 		return
 	}
 	a := m.agents[idx]
-	wt, present := a.worktree, a.worktreePresent
+	wt, repoDir, present := a.worktree, a.repoDir, a.worktreePresent
 	m.agents = append(m.agents[:idx], m.agents[idx+1:]...)
 	m.mu.Unlock()
 	if present {
-		m.removeWorktree(wt)
+		m.removeWorktree(repoDir, wt)
 	}
 	m.ping()
 }
@@ -415,16 +423,16 @@ func (m *Manager) index(id string) int {
 	return -1
 }
 
-func (m *Manager) addWorktree(branch, path string) error {
-	cmd := exec.Command("git", "-C", m.repoDir, "worktree", "add", "-b", branch, path, "HEAD")
+func (m *Manager) addWorktree(repoDir, branch, path string) error {
+	cmd := exec.Command("git", "-C", repoDir, "worktree", "add", "-b", branch, path, "HEAD")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("worktree add: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
 
-func (m *Manager) removeWorktree(path string) {
-	_ = exec.Command("git", "-C", m.repoDir, "worktree", "remove", "--force", path).Run()
+func (m *Manager) removeWorktree(repoDir, path string) {
+	_ = exec.Command("git", "-C", repoDir, "worktree", "remove", "--force", path).Run()
 }
 
 func claudeArgs(spec Spec) []string {

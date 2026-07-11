@@ -145,26 +145,16 @@ func githubEnv(repo string) []string {
 	return append(os.Environ(), "GITHUB_REPOSITORY="+repo)
 }
 
-// Sync pushes a single issue's current state to GitHub via
-// `bd github sync --push-only --issues <id>`. Push-only and issue-scoped so a
-// status edit never pulls unrelated remote changes into the local DB behind the
-// user's back.
-func (c *Client) Sync(ctx context.Context, id, repo string) error {
-	cmd := exec.CommandContext(ctx, "bd", "github", "sync", "--push-only", "--issues", id)
-	cmd.Dir = c.Dir
-	cmd.Env = githubEnv(repo)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("bd github sync: %w: %s", err, sanitize(strings.TrimSpace(string(out))))
+// SyncIssues pushes the given beads to GitHub via
+// `bd github sync --push-only --issues <ids>`, targeting repo. Push-only and
+// issue-scoped so a sync never pulls unrelated remote changes back, and scoped
+// to one repo so a meta-repo can push each group to its own repo. bd only sends
+// what differs from the last sync, so an unchanged group is a no-op.
+func (c *Client) SyncIssues(ctx context.Context, ids []string, repo string) error {
+	if len(ids) == 0 {
+		return nil
 	}
-	return nil
-}
-
-// PushAll pushes every changed bead to GitHub via `bd github sync --push-only`
-// (bd only sends what differs from the last sync). Used to keep GitHub in step
-// with bead writes that originate outside beadsboard — e.g. `bd create` on the
-// CLI, which beadsboard picks up on reload.
-func (c *Client) PushAll(ctx context.Context, repo string) error {
-	cmd := exec.CommandContext(ctx, "bd", "github", "sync", "--push-only")
+	cmd := exec.CommandContext(ctx, "bd", "github", "sync", "--push-only", "--issues", strings.Join(ids, ","))
 	cmd.Dir = c.Dir
 	cmd.Env = githubEnv(repo)
 	if out, err := cmd.CombinedOutput(); err != nil {
