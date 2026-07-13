@@ -73,11 +73,17 @@ func globalPath() (string, error) {
 	return filepath.Join(home, dirName, fileName), nil
 }
 
+// LocalPath is dir's own ./.beadsboard/config.toml, whether or not it exists —
+// the file `beadsboard init` creates to make dir's config the source of truth.
+func LocalPath(dir string) string {
+	return filepath.Join(dir, dirName, fileName)
+}
+
 // Resolve returns the config file governing dir: a local ./.beadsboard/
 // config.toml beside the source repo when present (the source of truth),
 // otherwise the global ~/.beadsboard/config.toml.
 func Resolve(dir string) (string, error) {
-	local := filepath.Join(dir, dirName, fileName)
+	local := LocalPath(dir)
 	if _, err := os.Stat(local); err == nil {
 		return local, nil
 	}
