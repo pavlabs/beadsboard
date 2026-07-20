@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/pavlabs/beadsboard/internal/agentreg"
 )
 
 // NeedsInputMarker is the sentinel the spawn prompt asks the agent to emit when
@@ -50,8 +52,9 @@ type Spec struct {
 	MaxTurns       int // 0 = uncapped
 	PermissionMode string
 	AllowedTools   []string
-	Repo           string // GITHUB_REPOSITORY for the agent's own bd/gh, or ""
-	RepoDir        string // git repo to worktree from; "" = the manager's root repo
+	Repo           string        // GITHUB_REPOSITORY for the agent's own bd/gh, or ""
+	RepoDir        string        // git repo to worktree from; "" = the manager's root repo
+	Tool           agentreg.Tool // backend; "" defaults to claude
 }
 
 // View is an immutable snapshot of an agent for rendering.
@@ -80,6 +83,7 @@ type agent struct {
 	killIntent      bool
 	intervened      bool
 	worktreePresent bool
+	rec             agentreg.Record // this agent's registry entry
 }
 
 func (a *agent) snapshot() View {
@@ -112,6 +116,7 @@ type Manager struct {
 	seq       int
 	agents    []*agent
 	events    chan struct{}
+	reg       *agentreg.Registry // shared .beadsboard/agents registry; nil if unavailable
 }
 
 // New builds a Manager for repoDir. claudeBin is the Claude Code executable
@@ -131,7 +136,30 @@ func newAt(repoDir, claudeBin string, maxAgents int, base string) *Manager {
 	}
 	_ = os.MkdirAll(m.logDir, 0o755)
 	_ = os.MkdirAll(m.wtDir, 0o755)
+	// The registry lives at the beads root, not the scratch base. It's lazy —
+	// the on-disk dir appears only when the first agent is registered.
+	m.reg = agentreg.New(repoDir)
 	return m
+}
+
+// regPut, regRemove, regReap are nil-tolerant wrappers so registry I/O failures
+// never break agent lifecycle. They run outside m.mu (disk I/O off the hot path).
+func (m *Manager) regPut(rec agentreg.Record) {
+	if m.reg != nil {
+		_ = m.reg.Put(rec)
+	}
+}
+
+func (m *Manager) regRemove(id string) {
+	if m.reg != nil {
+		_ = m.reg.Remove(id)
+	}
+}
+
+func (m *Manager) regReap() {
+	if m.reg != nil {
+		_, _ = m.reg.Reap()
+	}
 }
 
 // Events fires whenever agent state changes in a way the UI should reflect.
@@ -159,6 +187,9 @@ func (m *Manager) Sweep() {
 	_ = os.MkdirAll(m.logDir, 0o755)
 	_ = os.MkdirAll(m.wtDir, 0o755)
 	_ = exec.Command("git", "-C", m.repoDir, "worktree", "prune").Run()
+	// Drop only registry records whose process is gone (crashed prior runs),
+	// leaving agents of a concurrent beadsboard instance untouched.
+	m.regReap()
 }
 
 // Spawn starts a headless agent for spec in a fresh worktree.
@@ -219,6 +250,10 @@ func (m *Manager) Spawn(spec Spec) (View, error) {
 		return View{}, fmt.Errorf("start claude: %w", err)
 	}
 
+	tool := spec.Tool
+	if tool == "" {
+		tool = agentreg.ToolClaude
+	}
 	a := &agent{
 		View: View{
 			ID: id, IssueID: spec.IssueID, Scope: spec.Scope,
@@ -226,10 +261,17 @@ func (m *Manager) Spawn(spec Spec) (View, error) {
 		},
 		worktree: wt, repoDir: srcRepo, cmd: cmd, cancel: cancel, worktreePresent: true,
 	}
+	a.rec = agentreg.Record{
+		ID: id, BeadID: spec.IssueID, Tool: tool, Mode: agentreg.ModeCoding,
+		PID: cmd.Process.Pid, Cwd: wt, Branch: branch,
+		Source: agentreg.SourceBeadsboard, StartedAt: a.Started,
+	}
 	m.mu.Lock()
 	m.agents = append(m.agents, a)
 	view := a.snapshot()
+	rec := a.rec
 	m.mu.Unlock()
+	m.regPut(rec)
 
 	go m.run(a, stdout, logFile, logPath)
 	m.ping()
@@ -265,9 +307,11 @@ func (m *Manager) ingest(a *agent, line []byte) {
 		return
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	var captured agentreg.Record
 	if sid := sessionID(ev); sid != "" && a.Session == "" {
 		a.Session = sid
+		a.rec.SessionID = sid
+		captured = a.rec
 	}
 	switch ev["type"] {
 	case "assistant":
@@ -279,6 +323,11 @@ func (m *Manager) ingest(a *agent, line []byte) {
 			a.pendingResult = r
 			a.Summary = firstLine(r)
 		}
+	}
+	m.mu.Unlock()
+	// Persist the session id once, so a rediscovered agent stays resumable.
+	if captured.ID != "" {
+		m.regPut(captured)
 	}
 }
 
@@ -305,9 +354,12 @@ func (m *Manager) finalize(a *agent, waitErr error, logPath string) {
 	if !keep {
 		a.worktreePresent = false
 	}
-	wt, repoDir := a.worktree, a.repoDir
+	wt, repoDir, id := a.worktree, a.repoDir, a.ID
 	m.mu.Unlock()
 
+	// The headless process has exited, so drop its registry record regardless of
+	// outcome; a needs-input agent stays visible via the in-memory Snapshot.
+	m.regRemove(id)
 	_ = os.Remove(logPath) // logs are ephemeral; the question/outcome is kept in memory
 	if !keep {
 		m.removeWorktree(repoDir, wt)
@@ -369,6 +421,7 @@ func (m *Manager) Dismiss(id string) {
 	wt, repoDir, present := a.worktree, a.repoDir, a.worktreePresent
 	m.agents = append(m.agents[:idx], m.agents[idx+1:]...)
 	m.mu.Unlock()
+	m.regRemove(id)
 	if present {
 		m.removeWorktree(repoDir, wt)
 	}
