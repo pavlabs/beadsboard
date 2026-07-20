@@ -18,8 +18,7 @@ func rec(id, bead string, pid int, started time.Time) Record {
 
 // Put/List/ForBead/Remove round-trip, and List is oldest-first.
 func TestPutListForBeadRemove(t *testing.T) {
-	r, err := New(t.TempDir())
-	require.NoError(t, err)
+	r := New(t.TempDir())
 
 	t0 := time.Now()
 	require.NoError(t, r.Put(rec("a-1", "bead-x", 111, t0.Add(2*time.Second))))
@@ -42,8 +41,7 @@ func TestPutListForBeadRemove(t *testing.T) {
 
 // Put replaces an existing record in place (e.g. to fill in the session id).
 func TestPutOverwrites(t *testing.T) {
-	r, err := New(t.TempDir())
-	require.NoError(t, err)
+	r := New(t.TempDir())
 	require.NoError(t, r.Put(rec("a-1", "bead-x", 111, time.Now())))
 
 	updated := rec("a-1", "bead-x", 111, time.Now())
@@ -56,17 +54,29 @@ func TestPutOverwrites(t *testing.T) {
 	require.Equal(t, "sess-9", all[0].SessionID)
 }
 
-func TestPutRejectsBadID(t *testing.T) {
-	r, err := New(t.TempDir())
+// A fresh registry touches no disk: List is empty and the dir is not created.
+func TestLazyNoDirUntilPut(t *testing.T) {
+	root := t.TempDir()
+	r := New(root)
+	all, err := r.List()
 	require.NoError(t, err)
+	require.Empty(t, all)
+	_, statErr := os.Stat(r.Dir())
+	require.True(t, os.IsNotExist(statErr), "dir must not exist before first Put")
+
+	require.NoError(t, r.Put(rec("a-1", "b", 1, time.Now())))
+	require.DirExists(t, r.Dir(), "dir created on first Put")
+}
+
+func TestPutRejectsBadID(t *testing.T) {
+	r := New(t.TempDir())
 	require.Error(t, r.Put(rec("", "b", 1, time.Now())))
 	require.Error(t, r.Put(rec("a/b", "b", 1, time.Now())), "no path separators")
 }
 
 // Alive tracks a real process's lifetime; Reap drops the dead ones only.
 func TestAliveAndReap(t *testing.T) {
-	r, err := New(t.TempDir())
-	require.NoError(t, err)
+	r := New(t.TempDir())
 
 	// A finished process: its PID is dead.
 	done := exec.Command("true")

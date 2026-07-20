@@ -68,13 +68,11 @@ type Registry struct {
 	dir string
 }
 
-// New opens (creating if needed) the registry under beadsRoot/.beadsboard/agents.
-func New(beadsRoot string) (*Registry, error) {
-	dir := config.AgentsDir(beadsRoot)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, fmt.Errorf("agents dir: %w", err)
-	}
-	return &Registry{dir: dir}, nil
+// New returns the registry under beadsRoot/.beadsboard/agents. It touches no
+// disk: the directory is created lazily on the first Put, so merely browsing a
+// repo (no agents launched) never litters it with a .beadsboard/agents dir.
+func New(beadsRoot string) *Registry {
+	return &Registry{dir: config.AgentsDir(beadsRoot)}
 }
 
 // Dir is the registry directory, exposed for hooks and tests.
@@ -89,6 +87,9 @@ func (r *Registry) Put(rec Record) error {
 	b, err := json.MarshalIndent(rec, "", "  ")
 	if err != nil {
 		return err
+	}
+	if err := os.MkdirAll(r.dir, 0o755); err != nil {
+		return fmt.Errorf("agents dir: %w", err)
 	}
 	path := r.path(rec.ID)
 	tmp := path + ".tmp"
@@ -110,6 +111,9 @@ func (r *Registry) Remove(id string) error {
 // removal or are malformed are skipped rather than failing the whole read.
 func (r *Registry) List() ([]Record, error) {
 	entries, err := os.ReadDir(r.dir)
+	if os.IsNotExist(err) {
+		return nil, nil // lazy: never written, so no agents
+	}
 	if err != nil {
 		return nil, err
 	}
