@@ -46,6 +46,29 @@ Projects board in step:
 - **`G`** pulls the other way — reads the board (or issue state + `status::` labels)
   and reconciles bead status, so a teammate moving a card flows back into bd.
 
+## Agents on a task
+
+A task's detail page lists every agent working that bead — beadsboard's own
+headless agents plus *external* ones — with a liveness dot and each agent's tool,
+mode, and source. Records live in `.beadsboard/agents/` (one JSON per agent).
+
+To surface an **external** Claude Code session (one you launched yourself) on its
+bead, check out a `bead/<id>` branch and wire `hooks/session-agent.sh` for
+`SessionStart`/`SessionEnd` in your `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "/abs/path/to/beadsboard/hooks/session-agent.sh" }] }],
+    "SessionEnd":   [{ "hooks": [{ "type": "command", "command": "/abs/path/to/beadsboard/hooks/session-agent.sh" }] }]
+  }
+}
+```
+
+The session registers against the bead named by its `bead/<id>` branch; sessions
+on any other branch are ignored, and beadsboard-launched agents register
+themselves. (`bd` and `jq` must be on `PATH`.)
+
 ## Use cases
 
 **Single repo (the default).** Beads live in the repo you're working on

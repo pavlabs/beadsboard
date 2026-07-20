@@ -25,6 +25,14 @@ func main() {
 		return
 	}
 
+	if len(os.Args) > 1 && os.Args[1] == "agent" {
+		if err := runAgentCmd(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "beadsboard:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	source := flag.String("source", ".", "beads repository directory to browse (must contain .beads/)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
