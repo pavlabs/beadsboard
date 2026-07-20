@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -62,6 +61,7 @@ type View struct {
 	ID       string
 	IssueID  string
 	Scope    string
+	Tool     agentreg.Tool // backend that ran it, mirrors agentreg.Record.Tool
 	Status   Status
 	Question string
 	Summary  string
@@ -74,6 +74,7 @@ type View struct {
 
 type agent struct {
 	View
+	backend         Backend
 	worktree        string
 	repoDir         string // the git repo its worktree was cut from
 	cmd             *exec.Cmd
@@ -109,7 +110,7 @@ func (a *agent) push(s string) {
 type Manager struct {
 	mu        sync.Mutex
 	repoDir   string
-	claudeBin string
+	backends  map[string]Backend
 	maxAgents int
 	logDir    string
 	wtDir     string
@@ -127,8 +128,11 @@ func New(repoDir, claudeBin string, maxAgents int) *Manager {
 
 func newAt(repoDir, claudeBin string, maxAgents int, base string) *Manager {
 	m := &Manager{
-		repoDir:   repoDir,
-		claudeBin: claudeBin,
+		repoDir: repoDir,
+		backends: map[string]Backend{
+			string(agentreg.ToolClaude): claudeBackend{bin: claudeBin},
+			string(agentreg.ToolCodex):  codexBackend{bin: "codex"},
+		},
 		maxAgents: maxAgents,
 		logDir:    filepath.Join(base, "logs"),
 		wtDir:     filepath.Join(base, "wt"),
@@ -229,8 +233,14 @@ func (m *Manager) Spawn(spec Spec) (View, error) {
 		return View{}, fmt.Errorf("create log: %w", err)
 	}
 
+	tool := spec.Tool
+	if tool == "" {
+		tool = agentreg.ToolClaude
+	}
+	b := m.backendFor(tool)
+
 	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, m.claudeBin, claudeArgs(spec)...)
+	cmd := exec.CommandContext(ctx, b.Bin(), b.HeadlessArgs(spec)...)
 	cmd.Dir = wt
 	if spec.Repo != "" {
 		cmd.Env = append(os.Environ(), "GITHUB_REPOSITORY="+spec.Repo)
@@ -247,18 +257,15 @@ func (m *Manager) Spawn(spec Spec) (View, error) {
 		cancel()
 		_ = logFile.Close()
 		m.cleanupSpawn(srcRepo, logPath, wt)
-		return View{}, fmt.Errorf("start claude: %w", err)
+		return View{}, fmt.Errorf("start agent: %w", err)
 	}
 
-	tool := spec.Tool
-	if tool == "" {
-		tool = agentreg.ToolClaude
-	}
 	a := &agent{
 		View: View{
-			ID: id, IssueID: spec.IssueID, Scope: spec.Scope,
+			ID: id, IssueID: spec.IssueID, Scope: spec.Scope, Tool: tool,
 			Status: Running, Branch: branch, Started: time.Now(),
 		},
+		backend:  b,
 		worktree: wt, repoDir: srcRepo, cmd: cmd, cancel: cancel, worktreePresent: true,
 	}
 	a.rec = agentreg.Record{
@@ -302,27 +309,23 @@ func (m *Manager) run(a *agent, stdout io.Reader, logFile *os.File, logPath stri
 }
 
 func (m *Manager) ingest(a *agent, line []byte) {
-	ev, ok := decode(line)
+	ev, ok := a.backend.Parse(line)
 	if !ok {
 		return
 	}
 	m.mu.Lock()
 	var captured agentreg.Record
-	if sid := sessionID(ev); sid != "" && a.Session == "" {
-		a.Session = sid
-		a.rec.SessionID = sid
+	if ev.Session != "" && a.Session == "" {
+		a.Session = ev.Session
+		a.rec.SessionID = ev.Session
 		captured = a.rec
 	}
-	switch ev["type"] {
-	case "assistant":
-		if t := assistantText(ev); t != "" {
-			a.push(t)
-		}
-	case "result":
-		if r := resultText(ev); r != "" {
-			a.pendingResult = r
-			a.Summary = firstLine(r)
-		}
+	if ev.Progress != "" {
+		a.push(ev.Progress)
+	}
+	if ev.Result != "" {
+		a.pendingResult = ev.Result
+		a.Summary = firstLine(ev.Result)
 	}
 	m.mu.Unlock()
 	// Persist the session id once, so a rediscovered agent stays resumable.
@@ -486,21 +489,6 @@ func (m *Manager) addWorktree(repoDir, branch, path string) error {
 
 func (m *Manager) removeWorktree(repoDir, path string) {
 	_ = exec.Command("git", "-C", repoDir, "worktree", "remove", "--force", path).Run()
-}
-
-func claudeArgs(spec Spec) []string {
-	args := []string{
-		"-p", spec.Prompt,
-		"--output-format", "stream-json", "--verbose",
-		"--permission-mode", spec.PermissionMode,
-	}
-	if len(spec.AllowedTools) > 0 {
-		args = append(args, "--allowedTools", strings.Join(spec.AllowedTools, ","))
-	}
-	if spec.MaxTurns > 0 {
-		args = append(args, "--max-turns", strconv.Itoa(spec.MaxTurns))
-	}
-	return args
 }
 
 // shortIssue reduces an issue id to a filesystem- and branch-safe stem.
