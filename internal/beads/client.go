@@ -94,6 +94,22 @@ func (c *Client) Update(ctx context.Context, id, field, value string) error {
 	return nil
 }
 
+// Delete removes an issue via `bd delete --force`, cascading to its dependents
+// when cascade is set — required to delete an epic together with its child tasks
+// (bd otherwise refuses rather than orphan them).
+func (c *Client) Delete(ctx context.Context, id string, cascade bool) error {
+	args := []string{"delete", id, "--force"}
+	if cascade {
+		args = append(args, "--cascade")
+	}
+	cmd := exec.CommandContext(ctx, "bd", args...)
+	cmd.Dir = c.Dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("bd delete: %w: %s", err, sanitize(strings.TrimSpace(string(out))))
+	}
+	return nil
+}
+
 // sanitize strips control bytes that could smuggle terminal escape sequences
 // (ANSI/OSC — e.g. clipboard writes or title rewrites) out of untrusted issue
 // text, while keeping newlines and tabs that legitimately shape descriptions.

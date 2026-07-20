@@ -64,6 +64,8 @@ type model struct {
 	showAll     bool // Agents tab: all agents vs scoped to the hovered epic
 	notice      string
 
+	pendingDelete string // bead id awaiting a delete confirmation; "" = none
+
 	settingsOpen bool
 	setField     int // which setting the cursor is on
 
@@ -118,6 +120,7 @@ type (
 		err error
 	}
 	editSavedMsg  struct{ err error }
+	deletedMsg    struct{ err error }
 	agentEventMsg struct{}
 	spawnedMsg    struct{ err error }
 	interveneMsg  struct{ err error }
@@ -316,6 +319,30 @@ func (m model) updateCmd(id, field, value string) tea.Cmd {
 	}
 }
 
+// handleConfirmDelete resolves the delete confirmation prompt: y deletes, any
+// other key cancels.
+func (m model) handleConfirmDelete(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	id := m.pendingDelete
+	m.pendingDelete = ""
+	if msg.String() != "y" {
+		return m, nil
+	}
+	m.loading = true
+	return m, tea.Batch(m.spinner.Tick, m.deleteCmd(id))
+}
+
+// deleteCmd removes a bead via `bd delete`, cascading to child tasks when the
+// target is an epic. The UI confirmation is the safety, so --force is passed.
+func (m model) deleteCmd(id string) tea.Cmd {
+	client := m.client
+	cascade := m.graph != nil && m.graph.Issues[id].IsEpic()
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		return deletedMsg{err: client.Delete(ctx, id, cascade)}
+	}
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -387,6 +414,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m.startReload() // reflect the saved change; hydrate then pushes it up
 
+	case deletedMsg:
+		if msg.err != nil {
+			m.loading = false
+			m.notice = msg.err.Error()
+			return m, nil
+		}
+		return m.startReload() // drop the deleted bead and reclamp cursors
+
 	case pushedMsg:
 		m.loading = false // held since hydratedMsg while the push ran
 		if msg.err != nil {
@@ -444,6 +479,9 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.searching {
 		return m.handleSearchKey(msg)
 	}
+	if m.pendingDelete != "" {
+		return m.handleConfirmDelete(msg)
+	}
 	m.notice = "" // any key dismisses a transient notice
 	switch msg.String() {
 	case "q", "ctrl+c":
@@ -489,6 +527,10 @@ func (m model) handleLeftKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if id := m.currentEpic(); id != "" {
 			m.tab = tabAgents
 			return m, m.spawnCmd(id, "epic")
+		}
+	case "d":
+		if id := m.currentEpic(); id != "" {
+			m.pendingDelete = id
 		}
 	case "A":
 		m.tab = tabAgents
@@ -551,6 +593,12 @@ func (m model) handleRightKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, m.spawnCmd(id, "task")
 			}
 		}
+	case "d":
+		if m.section == secTasks {
+			if id := m.currentTask(); id != "" {
+				m.pendingDelete = id
+			}
+		}
 	case "enter", "l", "right":
 		if m.section == secTasks && m.currentTask() != "" {
 			m.openTask()
@@ -593,6 +641,10 @@ func (m model) handleTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if id := m.target(); id != "" {
 			m.tab = tabAgents
 			return m, m.spawnCmd(id, "task")
+		}
+	case "d":
+		if id := m.target(); id != "" {
+			m.pendingDelete = id
 		}
 	case "up", "k":
 		m.detail.ScrollUp(1)

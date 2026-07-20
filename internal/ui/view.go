@@ -88,6 +88,16 @@ func (m model) headerLine() string {
 }
 
 func (m model) footerLine() string {
+	if m.pendingDelete != "" {
+		id := m.pendingDelete
+		warn := "delete " + id + "?"
+		if m.graph != nil && m.graph.Issues[id].IsEpic() {
+			if n := len(m.graph.Tasks[id]); n > 0 {
+				warn = fmt.Sprintf("delete %s and its %d task(s)?", id, n)
+			}
+		}
+		return "  " + lipgloss.NewStyle().Foreground(yellow).Render(warn+"  y confirm · any other key cancel")
+	}
 	if m.settingsOpen {
 		return dimStyle.Render("  ↑/↓ field · ←/→ change · s save · esc cancel")
 	}
