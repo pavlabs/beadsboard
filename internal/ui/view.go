@@ -454,6 +454,13 @@ func (m model) fields(id string, width int) string {
 	block(secDescription, "description", is.Description)
 	block(secNotes, "notes", is.Notes)
 
+	// A task's own detail page ends with a read-only ledger of the agents working
+	// it — its narrow beside-list preview and epics have no room for it.
+	if !is.IsEpic() && m.taskOpen {
+		put("")
+		put(m.renderBeadAgents(m.beadAgents(id), width, m.detail.Height))
+	}
+
 	return b.String()
 }
 

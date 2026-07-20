@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/pavlabs/beadsboard/internal/agent"
+	"github.com/pavlabs/beadsboard/internal/agentreg"
 	"github.com/pavlabs/beadsboard/internal/beads"
 	"github.com/pavlabs/beadsboard/internal/config"
 )
@@ -496,4 +497,129 @@ func agentWord(s agent.Status) string {
 		return "killed"
 	}
 	return "unknown"
+}
+
+// --- per-bead agents ledger ---------------------------------------------------
+
+// regCmd reads the shared registry off the UI goroutine and computes liveness
+// per record, so the render path only ever touches the cached result. The
+// registry is created eagerly in New(); guarding nil keeps tests that build the
+// model by hand from panicking.
+func (m model) regCmd() tea.Cmd {
+	reg := m.reg
+	if reg == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		recs, err := reg.List()
+		if err != nil {
+			return regLoadedMsg{} // unreadable registry reads as no external agents
+		}
+		alive := make(map[string]bool, len(recs))
+		for _, r := range recs {
+			alive[r.ID] = r.Alive()
+		}
+		return regLoadedMsg{records: recs, alive: alive}
+	}
+}
+
+// agentRow is one line of the per-bead ledger: an in-process headless agent, an
+// external registry record, or an internal agent enriched by its own record.
+type agentRow struct {
+	id         string
+	tool       string
+	mode       string
+	source     string
+	alive      bool
+	statusWord string
+	internal   bool       // backed by a live in-process agent (glyph/word from view)
+	view       agent.View // valid only when internal
+}
+
+// beadAgents merges the live in-process agents working beadID with the cached
+// registry records for it, deduped by ID (a record matching an internal row
+// enriches that row rather than adding a second line), active/alive-first then
+// stable — mirroring visibleAgents' ordering.
+func (m model) beadAgents(beadID string) []agentRow {
+	recByID := make(map[string]agentreg.Record, len(m.agentRecords))
+	for _, rec := range m.agentRecords {
+		if rec.BeadID == beadID {
+			recByID[rec.ID] = rec
+		}
+	}
+
+	var active, recent []agentRow
+	add := func(r agentRow) {
+		if r.alive {
+			active = append(active, r)
+		} else {
+			recent = append(recent, r)
+		}
+	}
+	seen := map[string]bool{}
+	for _, v := range m.mgr.Snapshot() {
+		if v.IssueID != beadID {
+			continue
+		}
+		seen[v.ID] = true
+		row := agentRow{
+			id: v.ID, tool: "claude", mode: "coding", source: "local",
+			alive: v.Status.Active(), statusWord: agentWord(v.Status),
+			internal: true, view: v,
+		}
+		if rec, ok := recByID[v.ID]; ok {
+			row.tool, row.mode, row.source = string(rec.Tool), string(rec.Mode), string(rec.Source)
+		}
+		add(row)
+	}
+	for _, rec := range m.agentRecords {
+		if rec.BeadID != beadID || seen[rec.ID] {
+			continue
+		}
+		alive := m.agentAlive[rec.ID]
+		word := "ended"
+		if alive {
+			word = "running"
+		}
+		add(agentRow{
+			id: rec.ID, tool: string(rec.Tool), mode: string(rec.Mode),
+			source: string(rec.Source), alive: alive, statusWord: word,
+		})
+	}
+	return append(active, recent...)
+}
+
+// beadAgentGlyph is the liveness marker: an internal row reuses the status glyph,
+// an external one shows a live/idle dot from its cached liveness.
+func beadAgentGlyph(r agentRow) string {
+	if r.internal {
+		return agentGlyph(r.view.Status)
+	}
+	if r.alive {
+		return lipgloss.NewStyle().Foreground(green).Render("◐")
+	}
+	return dimStyle.Render("·")
+}
+
+// renderBeadAgents is a compact read-only ledger of every agent working a bead:
+// a dim heading then one line per row with a liveness glyph and tool/mode/source
+// columns. Clipped to height so it never crowds out the notes above it.
+func (m model) renderBeadAgents(rows []agentRow, width, height int) string {
+	var b strings.Builder
+	b.WriteString(dimStyle.Render("AGENTS"))
+	if len(rows) == 0 {
+		b.WriteString("\n" + dimStyle.Render("  none"))
+		return b.String()
+	}
+	limit := max(height-1, 1)
+	if len(rows) > limit {
+		rows = rows[:limit]
+	}
+	for _, r := range rows {
+		prefix := fmt.Sprintf("%s %-8s ", beadAgentGlyph(r), shortID(r.id))
+		cols := fmt.Sprintf("%-7s %-8s %-9s %s", r.tool, r.mode, r.source, r.statusWord)
+		colW := max(width-lipgloss.Width(prefix), 4)
+		b.WriteString("\n" + prefix + dimStyle.Render(truncate(cols, colW)))
+	}
+	return b.String()
 }

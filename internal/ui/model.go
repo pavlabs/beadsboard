@@ -16,6 +16,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/pavlabs/beadsboard/internal/agent"
+	"github.com/pavlabs/beadsboard/internal/agentreg"
 	"github.com/pavlabs/beadsboard/internal/beads"
 	"github.com/pavlabs/beadsboard/internal/config"
 )
@@ -53,6 +54,10 @@ type model struct {
 	cfgPath    string // resolved config file we watch and save back to
 	cfgModTime time.Time
 	mgr        *agent.Manager
+
+	reg          *agentreg.Registry // shared on-disk registry of agents working each bead
+	agentRecords []agentreg.Record  // last registry snapshot, read off the render path
+	agentAlive   map[string]bool    // liveness per record ID, computed with the snapshot
 
 	tab         int  // tabDetails | tabAgents
 	agentCursor int  // selected agent in the Agents tab
@@ -128,6 +133,10 @@ type (
 		refs []string // task issue URLs confirmed linked as sub-issues
 		err  error
 	}
+	regLoadedMsg struct {
+		records []agentreg.Record
+		alive   map[string]bool
+	}
 )
 
 // newInputs builds the title and description/notes editors with their shared
@@ -150,6 +159,7 @@ func New(dir string) model {
 	cfg, cfgPath, _ := config.Load(dir)
 	mgr := agent.New(dir, "claude", cfg.MaxAgents)
 	mgr.Sweep() // clear scratch from any prior crashed run
+	reg := agentreg.New(dir)
 
 	var modTime time.Time
 	if fi, err := os.Stat(cfgPath); err == nil {
@@ -168,6 +178,7 @@ func New(dir string) model {
 		cfgPath:    cfgPath,
 		cfgModTime: modTime,
 		mgr:        mgr,
+		reg:        reg,
 		subLinked:  map[string]bool{},
 	}
 }
@@ -175,7 +186,7 @@ func New(dir string) model {
 func (m model) Init() tea.Cmd {
 	// The post-load fingerprint from hydrateCmd seeds the watcher baseline, so no
 	// independent fpCmd here; the hydrate handler kicks off the GitHub push.
-	return tea.Batch(m.spinner.Tick, m.hydrateCmd(), tickCmd(), m.waitAgentEvent())
+	return tea.Batch(m.spinner.Tick, m.hydrateCmd(), tickCmd(), m.waitAgentEvent(), m.regCmd())
 }
 
 // waitAgentEvent blocks on the manager's event channel and re-arms itself, so
@@ -338,12 +349,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		m.reloadConfigIfChanged()
 		m.mgr.PruneRecent(time.Duration(m.cfg.RecentTTLSecs) * time.Second)
-		return m, tea.Batch(m.fpCmd(), tickCmd())
+		return m, tea.Batch(m.fpCmd(), tickCmd(), m.regCmd())
 
 	case agentEventMsg:
 		m.clampAgentCursor()
 		m.resizeDetail() // tab bar appearing/disappearing shifts the right pane
-		return m, m.waitAgentEvent()
+		return m, tea.Batch(m.waitAgentEvent(), m.regCmd())
 
 	case spawnedMsg:
 		if msg.err != nil {
@@ -386,6 +397,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.fp = msg.fp // absorb the push's own writes so it doesn't self-trigger
 		}
 		return m, m.linkSubIssuesCmd() // mirror the epic→task hierarchy as sub-issues
+
+	case regLoadedMsg:
+		m.agentRecords, m.agentAlive = msg.records, msg.alive
+		return m, nil
 
 	case linkedMsg:
 		for _, ref := range msg.refs {
