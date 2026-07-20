@@ -23,7 +23,7 @@ import (
 // spawnCmd launches a headless agent for the issue off the UI goroutine. With
 // the GitHub plugin on it first ensures the bead has a linked issue (so the
 // agent's PR can close it) and passes the repo into the agent's environment.
-func (m model) spawnCmd(issueID, scope string) tea.Cmd {
+func (m model) spawnCmd(issueID, scope string, tool agentreg.Tool) tea.Cmd {
 	title, ref := "", ""
 	var labels []string
 	if is, ok := m.graph.Issues[issueID]; ok {
@@ -44,6 +44,7 @@ func (m model) spawnCmd(issueID, scope string) tea.Cmd {
 		spec := agent.Spec{
 			IssueID:        issueID,
 			Scope:          scope,
+			Tool:           tool,
 			Prompt:         buildPrompt(issueID, scope, title, beadsRoot, cfg.GitHubSync, beads.GithubNumber(ref)),
 			MaxTurns:       cfg.MaxTurns,
 			PermissionMode: cfg.PermissionMode,
@@ -130,24 +131,101 @@ func buildPrompt(id, scope, title, beadsRoot string, ghSync bool, issueNum int) 
 	return sb.String()
 }
 
+// buildPlanningPrompt seeds an interactive planning session: shape the backlog
+// via bd, no implementation. bd lives at beadsRoot so every command is -C'd.
+func buildPlanningPrompt(id, scope, title, beadsRoot string) string {
+	var sb strings.Builder
+	sb.WriteString("You are planning, not implementing. Do NOT write code, commit, or open a PR.\n\n")
+	fmt.Fprintf(&sb, "This project's beads live at %s — prefix every bd command with `-C %s` (e.g. `bd -C %s show %s`, `bd -C %s update %s ...`, `bd -C %s create ...`).\n\n", beadsRoot, beadsRoot, beadsRoot, id, beadsRoot, id, beadsRoot)
+	fmt.Fprintf(&sb, "Recall the project: run `bd -C %s prime`, then `bd -C %s show %s` and read it in full.\n\n", beadsRoot, beadsRoot, id)
+	if scope == "epic" {
+		fmt.Fprintf(&sb, "Plan epic %s «%s»: break it into well-scoped tasks in dependency order, then create or update them as beads via `bd -C %s`.", id, title, beadsRoot)
+	} else {
+		fmt.Fprintf(&sb, "Plan task %s «%s»: sharpen its scope and acceptance, refine its description via `bd -C %s`, and split it into new beads if it is too big.", id, title, beadsRoot)
+	}
+	return sb.String()
+}
+
 // interveneCmd opens an interactive resume of the agent's session in a floating
-// zellij pane. Requires running inside a zellij session.
-func interveneCmd(cwd, session string) tea.Cmd {
+// zellij pane, using the agent's own backend to build the resume command.
+// Requires running inside a zellij session.
+func interveneCmd(cwd, session string, b agent.Backend) tea.Cmd {
 	return func() tea.Msg {
+		resume := append([]string{b.Bin()}, b.ResumeArgs(session)...)
 		if os.Getenv("ZELLIJ") == "" {
-			return interveneMsg{err: fmt.Errorf("not in zellij — resume manually: cd %s && claude --resume %s", cwd, session)}
+			return interveneMsg{err: fmt.Errorf("not in zellij — resume manually: cd %s && %s", cwd, strings.Join(resume, " "))}
 		}
 		name := "resume " + session
 		if len(name) > 24 {
 			name = name[:24]
 		}
-		cmd := exec.Command("zellij", "run", "--floating", "--close-on-exit",
-			"--name", name, "--cwd", cwd, "--", "claude", "--resume", session)
+		args := append([]string{"run", "--floating", "--close-on-exit", "--name", name, "--cwd", cwd, "--"}, resume...)
+		cmd := exec.Command("zellij", args...)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return interveneMsg{err: fmt.Errorf("zellij: %w: %s", err, strings.TrimSpace(string(out)))}
 		}
 		return interveneMsg{}
 	}
+}
+
+// planCmd opens an interactive planning session for a bead in a floating zellij
+// pane rooted at the beads dir. Unlike a coding spawn it is local-only — no
+// worktree, branch, or PR — the session just runs bd and shapes the backlog. It
+// registers itself in the agent registry for the pane's lifetime (so the ledger
+// shows it) and deregisters on exit. Requires running inside a zellij session.
+func (m model) planCmd(target, scope string, tool agentreg.Tool) tea.Cmd {
+	title := ""
+	if is, ok := m.graph.Issues[target]; ok {
+		title = is.Title
+	}
+	beadsRoot := m.client.Dir
+	b := m.mgr.Backend(tool)
+	prompt := buildPlanningPrompt(target, scope, title, beadsRoot)
+	return func() tea.Msg {
+		session := shQuote(b.Bin()) + " " + shQuote(prompt)
+		if os.Getenv("ZELLIJ") == "" {
+			return interveneMsg{err: fmt.Errorf("not in zellij — plan manually: cd %s && %s", beadsRoot, session)}
+		}
+		id := planSessionID(target)
+		// Bracket the interactive session with register/unregister so the ledger
+		// tracks it; $PWD is the pane's cwd (beadsRoot) and $$ its pid, for liveness.
+		script := fmt.Sprintf(
+			"beadsboard agent register --id %s --bead %s --mode planning --source beadsboard --tool %s --cwd \"$PWD\" --pid $$; %s; beadsboard agent unregister --id %s",
+			shQuote(id), shQuote(target), shQuote(string(tool)), session, shQuote(id),
+		)
+		name := "plan " + target
+		if len(name) > 24 {
+			name = name[:24]
+		}
+		cmd := exec.Command("zellij", "run", "--floating", "--close-on-exit",
+			"--name", name, "--cwd", beadsRoot, "--", "sh", "-c", script)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return interveneMsg{err: fmt.Errorf("zellij: %w: %s", err, strings.TrimSpace(string(out)))}
+		}
+		return interveneMsg{}
+	}
+}
+
+// planSessionID is a registry-safe unique id for a planning pane: a sanitized
+// bead id plus a timestamp, so concurrent plans on one bead don't collide.
+func planSessionID(bead string) string {
+	var sb strings.Builder
+	sb.WriteString("plan-")
+	for _, r := range bead {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '.':
+			sb.WriteRune(r)
+		default:
+			sb.WriteByte('-')
+		}
+	}
+	fmt.Fprintf(&sb, "-%d", time.Now().UnixNano())
+	return sb.String()
+}
+
+// shQuote single-quotes s for safe interpolation into an `sh -c` script.
+func shQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // --- Agents tab keys ----------------------------------------------------------
@@ -182,12 +260,59 @@ func (m model) handleAgentsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		if a, ok := m.selectedAgent(); ok {
 			if cwd, sess, ok := m.mgr.Intervene(a.ID); ok {
-				return m, interveneCmd(cwd, sess)
+				return m, interveneCmd(cwd, sess, m.mgr.Backend(a.Tool))
 			}
 			m.notice = "no session captured yet — can't resume"
 		}
 	}
 	return m, nil
+}
+
+// --- launcher matrix ----------------------------------------------------------
+
+// handlePickerKey drives the launcher matrix (coding/planning × claude/codex).
+// The mode letters c/p only move the row; the backend letters l/o pick the column
+// AND dispatch, so a blind chord `a c l` / `a p o` completes on the tool letter.
+// Horizontal nav is arrows-only — h/l would collide with the claude chord.
+func (m model) handlePickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc":
+		m.pickerOpen = false
+	case "c":
+		m.pickerMode = pickCoding
+	case "p":
+		m.pickerMode = pickPlanning
+	case "l":
+		m.pickerBackend = pickClaude
+		return m.dispatchPicker()
+	case "o":
+		m.pickerBackend = pickCodex
+		return m.dispatchPicker()
+	case "up", "down", "j", "k":
+		m.pickerMode = (m.pickerMode + 1) % 2 // two rows: toggle
+	case "left", "right":
+		m.pickerBackend = (m.pickerBackend + 1) % 2 // two columns: toggle
+	case "enter":
+		return m.dispatchPicker()
+	}
+	return m, nil
+}
+
+// dispatchPicker closes the picker and launches the armed cell: a coding cell
+// spawns a headless agent and switches to the Agents tab; a planning cell opens
+// an interactive local session, staying on the current tab (like intervene).
+func (m model) dispatchPicker() (tea.Model, tea.Cmd) {
+	target, scope := m.pickerTarget, m.pickerScope
+	tool := pickerTools[m.pickerBackend]
+	planning := m.pickerMode == pickPlanning
+	m.pickerOpen = false
+	if planning {
+		return m, m.planCmd(target, scope, tool)
+	}
+	m.tab = tabAgents
+	return m, m.spawnCmd(target, scope, tool)
 }
 
 // visibleAgents lists agents, active first, filtered to the hovered epic unless
@@ -445,6 +570,29 @@ func (m model) settingsView(width, height int) string {
 		b.WriteByte('\n')
 	}
 	b.WriteString("\n" + dimStyle.Render("tools & github sync live in the config file"))
+	return b.String()
+}
+
+// pickerView draws the launcher matrix — coding/planning rows × claude/codex
+// columns — highlighting the armed cell and labelling each with its blind chord.
+func (m model) pickerView(width, height int) string {
+	modes := []struct{ label, key string }{{"coding", "c"}, {"planning", "p"}}
+	tools := []struct{ label, key string }{{"claude", "l"}, {"codex", "o"}}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s\n\n", dimStyle.Render("LAUNCH "+shortID(m.pickerTarget)+" ("+m.pickerScope+")"))
+	for mi, mo := range modes {
+		for ti, to := range tools {
+			line := fmt.Sprintf("%-9s %-7s a %s %s", mo.label, to.label, mo.key, to.key)
+			if mi == m.pickerMode && ti == m.pickerBackend {
+				b.WriteString(selectedStyle.Render(" " + line + " "))
+			} else {
+				b.WriteString(labelStyle.Render("  " + line))
+			}
+			b.WriteByte('\n')
+		}
+	}
+	b.WriteString("\n" + dimStyle.Render("coding spawns a headless agent · planning opens a local session"))
 	return b.String()
 }
 

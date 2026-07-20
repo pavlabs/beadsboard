@@ -14,13 +14,100 @@ import (
 	"github.com/pavlabs/beadsboard/internal/agentreg"
 )
 
-// a on a hovered epic switches to the Agents tab and issues a spawn command.
-func TestSpawnKeyOpensAgentsTab(t *testing.T) {
+// a on a hovered epic arms the launcher matrix for that bead rather than
+// spawning directly; it does not switch tabs until a cell is dispatched.
+func TestSpawnKeyOpensPicker(t *testing.T) {
 	m := testModel()
 	next, cmd := m.handleKey(keyMsg("a"))
 	m = next.(model)
-	require.Equal(t, tabAgents, m.tab)
-	require.NotNil(t, cmd, "a issues a spawn command")
+	require.True(t, m.pickerOpen)
+	require.Equal(t, m.currentEpic(), m.pickerTarget)
+	require.Equal(t, "epic", m.pickerScope)
+	require.Equal(t, pickCoding, m.pickerMode, "defaults to coding")
+	require.Equal(t, pickClaude, m.pickerBackend, "defaults to claude")
+	require.Equal(t, tabDetails, m.tab, "arming does not switch tabs")
+	require.Nil(t, cmd)
+}
+
+// The mode letters c/p move the picker row without dispatching; esc closes it.
+func TestPickerModeSelectAndClose(t *testing.T) {
+	m := testModel()
+	m.openPicker("a", "epic")
+
+	next, cmd := m.handleKey(keyMsg("p"))
+	m = next.(model)
+	require.True(t, m.pickerOpen, "a mode letter only moves the row")
+	require.Equal(t, pickPlanning, m.pickerMode)
+	require.Nil(t, cmd)
+
+	next, _ = m.handleKey(keyMsg("c"))
+	m = next.(model)
+	require.Equal(t, pickCoding, m.pickerMode)
+
+	next, _ = m.handleKey(keyMsg("esc"))
+	m = next.(model)
+	require.False(t, m.pickerOpen, "esc closes the picker")
+}
+
+// The chord a-c-l lands the coding+claude cell: it dispatches a spawn and
+// switches to the Agents tab.
+func TestPickerChordCodingClaude(t *testing.T) {
+	m := testModel()
+	m.openPicker("a", "epic")
+	next, _ := m.handleKey(keyMsg("c"))
+	m = next.(model)
+	next, cmd := m.handleKey(keyMsg("l"))
+	m = next.(model)
+	require.False(t, m.pickerOpen, "the tool letter dispatches and closes")
+	require.Equal(t, tabAgents, m.tab, "coding switches to the Agents tab")
+	require.NotNil(t, cmd, "dispatch issues a spawn command")
+}
+
+// The chord a-p-l lands the planning+claude cell: it dispatches a local planning
+// session and stays on the current tab (no tab switch).
+func TestPickerChordPlanningClaude(t *testing.T) {
+	m := testModel()
+	m.openPicker("a", "epic")
+	next, _ := m.handleKey(keyMsg("p"))
+	m = next.(model)
+	next, cmd := m.handleKey(keyMsg("l"))
+	m = next.(model)
+	require.False(t, m.pickerOpen)
+	require.Equal(t, tabDetails, m.tab, "planning stays on the current tab")
+	require.NotNil(t, cmd, "dispatch issues a planning command")
+}
+
+// Arrow navigation moves both axes; enter dispatches the armed cell. Down moves
+// to the planning row and right to the codex column before enter fires.
+func TestPickerArrowNavAndEnter(t *testing.T) {
+	m := testModel()
+	m.openPicker("a", "epic")
+
+	next, _ := m.handleKey(keyMsg("down"))
+	m = next.(model)
+	require.Equal(t, pickPlanning, m.pickerMode)
+
+	next, _ = m.handleKey(keyMsg("right"))
+	m = next.(model)
+	require.Equal(t, pickCodex, m.pickerBackend)
+
+	next, cmd := m.handleKey(keyMsg("enter"))
+	m = next.(model)
+	require.False(t, m.pickerOpen, "enter dispatches and closes")
+	require.NotNil(t, cmd)
+}
+
+// The planning prompt tells the session to plan via bd and forbids implementation.
+func TestBuildPlanningPrompt(t *testing.T) {
+	epic := buildPlanningPrompt("ep-1", "epic", "Platform", "/root")
+	require.Contains(t, epic, "planning, not implementing")
+	require.Contains(t, epic, "-C /root")
+	require.Contains(t, epic, "ep-1")
+	require.NotContains(t, epic, "pull request", "planning never opens a PR")
+
+	task := buildPlanningPrompt("bd-1", "task", "Add cache", "/root")
+	require.Contains(t, task, "bd-1")
+	require.Contains(t, task, "Add cache")
 }
 
 // A shows all agents in the Agents tab; with none spawned it shows the empty

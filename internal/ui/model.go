@@ -69,6 +69,12 @@ type model struct {
 	settingsOpen bool
 	setField     int // which setting the cursor is on
 
+	pickerOpen    bool   // the launcher matrix is capturing keys
+	pickerTarget  string // bead the launch acts on
+	pickerScope   string // "task" | "epic"
+	pickerMode    int    // pickCoding | pickPlanning
+	pickerBackend int    // pickClaude | pickCodex
+
 	fp    uint64
 	hasFP bool
 
@@ -103,6 +109,21 @@ const (
 	scopeEpics = iota
 	scopeTasks
 )
+
+// Launcher matrix rows (mode) and columns (backend). The chord letters are c/p
+// for the rows and l/o for the columns, so a blind `a c l` etc. lands a cell.
+const (
+	pickCoding = iota
+	pickPlanning
+)
+
+const (
+	pickClaude = iota
+	pickCodex
+)
+
+// pickerTools maps the backend column to its tool.
+var pickerTools = []agentreg.Tool{agentreg.ToolClaude, agentreg.ToolCodex}
 
 // editStatuses are the statuses the status field cycles through when editing.
 var editStatuses = []string{"open", "in_progress", "blocked", "closed"}
@@ -479,6 +500,9 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.searching {
 		return m.handleSearchKey(msg)
 	}
+	if m.pickerOpen {
+		return m.handlePickerKey(msg)
+	}
 	if m.pendingDelete != "" {
 		return m.handleConfirmDelete(msg)
 	}
@@ -525,8 +549,7 @@ func (m model) handleLeftKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.startSearch(scopeEpics)
 	case "a":
 		if id := m.currentEpic(); id != "" {
-			m.tab = tabAgents
-			return m, m.spawnCmd(id, "epic")
+			m.openPicker(id, "epic")
 		}
 	case "d":
 		if id := m.currentEpic(); id != "" {
@@ -589,8 +612,7 @@ func (m model) handleRightKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "a":
 		if m.section == secTasks {
 			if id := m.currentTask(); id != "" {
-				m.tab = tabAgents
-				return m, m.spawnCmd(id, "task")
+				m.openPicker(id, "task")
 			}
 		}
 	case "d":
@@ -639,8 +661,7 @@ func (m model) handleTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "a":
 		if id := m.target(); id != "" {
-			m.tab = tabAgents
-			return m, m.spawnCmd(id, "task")
+			m.openPicker(id, "task")
 		}
 	case "d":
 		if id := m.target(); id != "" {
@@ -668,6 +689,16 @@ func (m *model) closeTask() {
 	m.section = secTasks
 	m.resizeDetail()
 	m.syncDetail()
+}
+
+// openPicker arms the launcher matrix for a bead, defaulting to the coding+claude
+// cell so `a` then enter is the common path.
+func (m *model) openPicker(target, scope string) {
+	m.pickerOpen = true
+	m.pickerTarget = target
+	m.pickerScope = scope
+	m.pickerMode = pickCoding
+	m.pickerBackend = pickClaude
 }
 
 // startSearch opens an incremental fuzzy filter over the given list scope.

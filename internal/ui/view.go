@@ -98,6 +98,9 @@ func (m model) footerLine() string {
 		}
 		return "  " + lipgloss.NewStyle().Foreground(yellow).Render(warn+"  y confirm · any other key cancel")
 	}
+	if m.pickerOpen {
+		return dimStyle.Render("  c coding · p planning · then l claude · o codex · ↑↓←→ move · enter launch · esc cancel")
+	}
 	if m.settingsOpen {
 		return dimStyle.Render("  ↑/↓ field · ←/→ change · s save · esc cancel")
 	}
@@ -141,6 +144,8 @@ func (m model) panes() string {
 	rh := m.rightInnerH()
 	var right string
 	switch {
+	case m.pickerOpen:
+		right = boxStyle.Width(rightOuter - 2).Height(rh).Render(m.pickerView(rightInner, rh))
 	case m.settingsOpen:
 		right = boxStyle.Width(rightOuter - 2).Height(rh).Render(m.settingsView(rightInner, rh))
 	case m.tab == tabAgents:
