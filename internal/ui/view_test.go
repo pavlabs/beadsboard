@@ -353,3 +353,22 @@ func TestTaskSectionCursor(t *testing.T) {
 	m = next.(model)
 	require.Equal(t, 1, m.taskCursor, "clamps at the last task")
 }
+
+// Pressing d on an epic arms a confirmation naming the child count; y proceeds
+// (enters loading), any other key cancels without deleting.
+func TestDeleteConfirmFlow(t *testing.T) {
+	m := testModel() // epic list, cursor on epic "a" (2 child tasks)
+
+	mm, _ := m.handleKey(keyMsg("d"))
+	m = mm.(model)
+	require.Equal(t, "a", m.pendingDelete)
+	require.Contains(t, m.footerLine(), "delete a and its 2 task(s)?")
+
+	cancelled, _ := m.handleKey(keyMsg("n"))
+	require.Empty(t, cancelled.(model).pendingDelete, "n cancels")
+
+	confirmed, cmd := m.handleKey(keyMsg("y"))
+	require.Empty(t, confirmed.(model).pendingDelete)
+	require.True(t, confirmed.(model).loading, "y proceeds to delete")
+	require.NotNil(t, cmd)
+}

@@ -79,6 +79,12 @@ func LocalPath(dir string) string {
 	return filepath.Join(dir, dirName, fileName)
 }
 
+// AgentsDir is dir's ./.beadsboard/agents — the shared registry where both
+// beadsboard-spawned and external agents drop a record per bead they work.
+func AgentsDir(dir string) string {
+	return filepath.Join(dir, dirName, "agents")
+}
+
 // Resolve returns the config file governing dir: a local ./.beadsboard/
 // config.toml beside the source repo when present (the source of truth),
 // otherwise the global ~/.beadsboard/config.toml.

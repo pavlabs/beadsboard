@@ -136,6 +136,31 @@ func TestSpawnWorktreesFromRepoDir(t *testing.T) {
 		2*time.Second, 20*time.Millisecond, "cleaned from the sub-repo on exit")
 }
 
+// claudeBackend.Parse folds a stream-json line into a normalized Event: the
+// session id from the init line, an assistant progress note (text + tools), the
+// final result, and nothing from a non-JSON line.
+func TestClaudeParse(t *testing.T) {
+	b := claudeBackend{bin: "claude"}
+	tests := []struct {
+		name string
+		line string
+		want Event
+		ok   bool
+	}{
+		{"init carries session", `{"type":"system","subtype":"init","session_id":"sess-1"}`, Event{Session: "sess-1"}, true},
+		{"assistant text and tool", `{"type":"assistant","message":{"content":[{"type":"text","text":"Looking"},{"type":"tool_use","name":"Read"}]}}`, Event{Progress: "Looking  → Read"}, true},
+		{"result text", `{"type":"result","result":"All done."}`, Event{Result: "All done."}, true},
+		{"non-json ignored", `not json`, Event{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ev, ok := b.Parse([]byte(tt.line))
+			require.Equal(t, tt.ok, ok)
+			require.Equal(t, tt.want, ev)
+		})
+	}
+}
+
 // The concurrency cap rejects spawns past the limit.
 func TestSpawnRespectsMaxAgents(t *testing.T) {
 	repo := gitRepo(t)

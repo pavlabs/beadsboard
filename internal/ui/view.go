@@ -88,6 +88,19 @@ func (m model) headerLine() string {
 }
 
 func (m model) footerLine() string {
+	if m.pendingDelete != "" {
+		id := m.pendingDelete
+		warn := "delete " + id + "?"
+		if m.graph != nil && m.graph.Issues[id].IsEpic() {
+			if n := len(m.graph.Tasks[id]); n > 0 {
+				warn = fmt.Sprintf("delete %s and its %d task(s)?", id, n)
+			}
+		}
+		return "  " + lipgloss.NewStyle().Foreground(yellow).Render(warn+"  y confirm · any other key cancel")
+	}
+	if m.pickerOpen {
+		return dimStyle.Render("  c coding · p planning · then l claude · o codex · ↑↓←→ move · enter launch · esc cancel")
+	}
 	if m.settingsOpen {
 		return dimStyle.Render("  ↑/↓ field · ←/→ change · s save · esc cancel")
 	}
@@ -131,6 +144,8 @@ func (m model) panes() string {
 	rh := m.rightInnerH()
 	var right string
 	switch {
+	case m.pickerOpen:
+		right = boxStyle.Width(rightOuter - 2).Height(rh).Render(m.pickerView(rightInner, rh))
 	case m.settingsOpen:
 		right = boxStyle.Width(rightOuter - 2).Height(rh).Render(m.settingsView(rightInner, rh))
 	case m.tab == tabAgents:
@@ -453,6 +468,13 @@ func (m model) fields(id string, width int) string {
 
 	block(secDescription, "description", is.Description)
 	block(secNotes, "notes", is.Notes)
+
+	// A task's own detail page ends with a read-only ledger of the agents working
+	// it — its narrow beside-list preview and epics have no room for it.
+	if !is.IsEpic() && m.taskOpen {
+		put("")
+		put(m.renderBeadAgents(m.beadAgents(id), width, m.detail.Height))
+	}
 
 	return b.String()
 }

@@ -13,10 +13,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/pavlabs/beadsboard/internal/agentreg"
 )
 
 // NeedsInputMarker is the sentinel the spawn prompt asks the agent to emit when
@@ -50,8 +51,9 @@ type Spec struct {
 	MaxTurns       int // 0 = uncapped
 	PermissionMode string
 	AllowedTools   []string
-	Repo           string // GITHUB_REPOSITORY for the agent's own bd/gh, or ""
-	RepoDir        string // git repo to worktree from; "" = the manager's root repo
+	Repo           string        // GITHUB_REPOSITORY for the agent's own bd/gh, or ""
+	RepoDir        string        // git repo to worktree from; "" = the manager's root repo
+	Tool           agentreg.Tool // backend; "" defaults to claude
 }
 
 // View is an immutable snapshot of an agent for rendering.
@@ -59,6 +61,7 @@ type View struct {
 	ID       string
 	IssueID  string
 	Scope    string
+	Tool     agentreg.Tool // backend that ran it, mirrors agentreg.Record.Tool
 	Status   Status
 	Question string
 	Summary  string
@@ -71,6 +74,7 @@ type View struct {
 
 type agent struct {
 	View
+	backend         Backend
 	worktree        string
 	repoDir         string // the git repo its worktree was cut from
 	cmd             *exec.Cmd
@@ -80,6 +84,7 @@ type agent struct {
 	killIntent      bool
 	intervened      bool
 	worktreePresent bool
+	rec             agentreg.Record // this agent's registry entry
 }
 
 func (a *agent) snapshot() View {
@@ -105,13 +110,14 @@ func (a *agent) push(s string) {
 type Manager struct {
 	mu        sync.Mutex
 	repoDir   string
-	claudeBin string
+	backends  map[string]Backend
 	maxAgents int
 	logDir    string
 	wtDir     string
 	seq       int
 	agents    []*agent
 	events    chan struct{}
+	reg       *agentreg.Registry // shared .beadsboard/agents registry; nil if unavailable
 }
 
 // New builds a Manager for repoDir. claudeBin is the Claude Code executable
@@ -122,8 +128,11 @@ func New(repoDir, claudeBin string, maxAgents int) *Manager {
 
 func newAt(repoDir, claudeBin string, maxAgents int, base string) *Manager {
 	m := &Manager{
-		repoDir:   repoDir,
-		claudeBin: claudeBin,
+		repoDir: repoDir,
+		backends: map[string]Backend{
+			string(agentreg.ToolClaude): claudeBackend{bin: claudeBin},
+			string(agentreg.ToolCodex):  codexBackend{bin: "codex"},
+		},
 		maxAgents: maxAgents,
 		logDir:    filepath.Join(base, "logs"),
 		wtDir:     filepath.Join(base, "wt"),
@@ -131,7 +140,30 @@ func newAt(repoDir, claudeBin string, maxAgents int, base string) *Manager {
 	}
 	_ = os.MkdirAll(m.logDir, 0o755)
 	_ = os.MkdirAll(m.wtDir, 0o755)
+	// The registry lives at the beads root, not the scratch base. It's lazy —
+	// the on-disk dir appears only when the first agent is registered.
+	m.reg = agentreg.New(repoDir)
 	return m
+}
+
+// regPut, regRemove, regReap are nil-tolerant wrappers so registry I/O failures
+// never break agent lifecycle. They run outside m.mu (disk I/O off the hot path).
+func (m *Manager) regPut(rec agentreg.Record) {
+	if m.reg != nil {
+		_ = m.reg.Put(rec)
+	}
+}
+
+func (m *Manager) regRemove(id string) {
+	if m.reg != nil {
+		_ = m.reg.Remove(id)
+	}
+}
+
+func (m *Manager) regReap() {
+	if m.reg != nil {
+		_, _ = m.reg.Reap()
+	}
 }
 
 // Events fires whenever agent state changes in a way the UI should reflect.
@@ -159,6 +191,9 @@ func (m *Manager) Sweep() {
 	_ = os.MkdirAll(m.logDir, 0o755)
 	_ = os.MkdirAll(m.wtDir, 0o755)
 	_ = exec.Command("git", "-C", m.repoDir, "worktree", "prune").Run()
+	// Drop only registry records whose process is gone (crashed prior runs),
+	// leaving agents of a concurrent beadsboard instance untouched.
+	m.regReap()
 }
 
 // Spawn starts a headless agent for spec in a fresh worktree.
@@ -198,8 +233,14 @@ func (m *Manager) Spawn(spec Spec) (View, error) {
 		return View{}, fmt.Errorf("create log: %w", err)
 	}
 
+	tool := spec.Tool
+	if tool == "" {
+		tool = agentreg.ToolClaude
+	}
+	b := m.backendFor(tool)
+
 	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, m.claudeBin, claudeArgs(spec)...)
+	cmd := exec.CommandContext(ctx, b.Bin(), b.HeadlessArgs(spec)...)
 	cmd.Dir = wt
 	if spec.Repo != "" {
 		cmd.Env = append(os.Environ(), "GITHUB_REPOSITORY="+spec.Repo)
@@ -216,20 +257,28 @@ func (m *Manager) Spawn(spec Spec) (View, error) {
 		cancel()
 		_ = logFile.Close()
 		m.cleanupSpawn(srcRepo, logPath, wt)
-		return View{}, fmt.Errorf("start claude: %w", err)
+		return View{}, fmt.Errorf("start agent: %w", err)
 	}
 
 	a := &agent{
 		View: View{
-			ID: id, IssueID: spec.IssueID, Scope: spec.Scope,
+			ID: id, IssueID: spec.IssueID, Scope: spec.Scope, Tool: tool,
 			Status: Running, Branch: branch, Started: time.Now(),
 		},
+		backend:  b,
 		worktree: wt, repoDir: srcRepo, cmd: cmd, cancel: cancel, worktreePresent: true,
+	}
+	a.rec = agentreg.Record{
+		ID: id, BeadID: spec.IssueID, Tool: tool, Mode: agentreg.ModeCoding,
+		PID: cmd.Process.Pid, Cwd: wt, Branch: branch,
+		Source: agentreg.SourceBeadsboard, StartedAt: a.Started,
 	}
 	m.mu.Lock()
 	m.agents = append(m.agents, a)
 	view := a.snapshot()
+	rec := a.rec
 	m.mu.Unlock()
+	m.regPut(rec)
 
 	go m.run(a, stdout, logFile, logPath)
 	m.ping()
@@ -260,25 +309,28 @@ func (m *Manager) run(a *agent, stdout io.Reader, logFile *os.File, logPath stri
 }
 
 func (m *Manager) ingest(a *agent, line []byte) {
-	ev, ok := decode(line)
+	ev, ok := a.backend.Parse(line)
 	if !ok {
 		return
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if sid := sessionID(ev); sid != "" && a.Session == "" {
-		a.Session = sid
+	var captured agentreg.Record
+	if ev.Session != "" && a.Session == "" {
+		a.Session = ev.Session
+		a.rec.SessionID = ev.Session
+		captured = a.rec
 	}
-	switch ev["type"] {
-	case "assistant":
-		if t := assistantText(ev); t != "" {
-			a.push(t)
-		}
-	case "result":
-		if r := resultText(ev); r != "" {
-			a.pendingResult = r
-			a.Summary = firstLine(r)
-		}
+	if ev.Progress != "" {
+		a.push(ev.Progress)
+	}
+	if ev.Result != "" {
+		a.pendingResult = ev.Result
+		a.Summary = firstLine(ev.Result)
+	}
+	m.mu.Unlock()
+	// Persist the session id once, so a rediscovered agent stays resumable.
+	if captured.ID != "" {
+		m.regPut(captured)
 	}
 }
 
@@ -305,9 +357,12 @@ func (m *Manager) finalize(a *agent, waitErr error, logPath string) {
 	if !keep {
 		a.worktreePresent = false
 	}
-	wt, repoDir := a.worktree, a.repoDir
+	wt, repoDir, id := a.worktree, a.repoDir, a.ID
 	m.mu.Unlock()
 
+	// The headless process has exited, so drop its registry record regardless of
+	// outcome; a needs-input agent stays visible via the in-memory Snapshot.
+	m.regRemove(id)
 	_ = os.Remove(logPath) // logs are ephemeral; the question/outcome is kept in memory
 	if !keep {
 		m.removeWorktree(repoDir, wt)
@@ -369,6 +424,7 @@ func (m *Manager) Dismiss(id string) {
 	wt, repoDir, present := a.worktree, a.repoDir, a.worktreePresent
 	m.agents = append(m.agents[:idx], m.agents[idx+1:]...)
 	m.mu.Unlock()
+	m.regRemove(id)
 	if present {
 		m.removeWorktree(repoDir, wt)
 	}
@@ -433,21 +489,6 @@ func (m *Manager) addWorktree(repoDir, branch, path string) error {
 
 func (m *Manager) removeWorktree(repoDir, path string) {
 	_ = exec.Command("git", "-C", repoDir, "worktree", "remove", "--force", path).Run()
-}
-
-func claudeArgs(spec Spec) []string {
-	args := []string{
-		"-p", spec.Prompt,
-		"--output-format", "stream-json", "--verbose",
-		"--permission-mode", spec.PermissionMode,
-	}
-	if len(spec.AllowedTools) > 0 {
-		args = append(args, "--allowedTools", strings.Join(spec.AllowedTools, ","))
-	}
-	if spec.MaxTurns > 0 {
-		args = append(args, "--max-turns", strconv.Itoa(spec.MaxTurns))
-	}
-	return args
 }
 
 // shortIssue reduces an issue id to a filesystem- and branch-safe stem.

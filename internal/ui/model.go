@@ -16,6 +16,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/pavlabs/beadsboard/internal/agent"
+	"github.com/pavlabs/beadsboard/internal/agentreg"
 	"github.com/pavlabs/beadsboard/internal/beads"
 	"github.com/pavlabs/beadsboard/internal/config"
 )
@@ -54,13 +55,25 @@ type model struct {
 	cfgModTime time.Time
 	mgr        *agent.Manager
 
+	reg          *agentreg.Registry // shared on-disk registry of agents working each bead
+	agentRecords []agentreg.Record  // last registry snapshot, read off the render path
+	agentAlive   map[string]bool    // liveness per record ID, computed with the snapshot
+
 	tab         int  // tabDetails | tabAgents
 	agentCursor int  // selected agent in the Agents tab
 	showAll     bool // Agents tab: all agents vs scoped to the hovered epic
 	notice      string
 
+	pendingDelete string // bead id awaiting a delete confirmation; "" = none
+
 	settingsOpen bool
 	setField     int // which setting the cursor is on
+
+	pickerOpen    bool   // the launcher matrix is capturing keys
+	pickerTarget  string // bead the launch acts on
+	pickerScope   string // "task" | "epic"
+	pickerMode    int    // pickCoding | pickPlanning
+	pickerBackend int    // pickClaude | pickCodex
 
 	fp    uint64
 	hasFP bool
@@ -97,6 +110,21 @@ const (
 	scopeTasks
 )
 
+// Launcher matrix rows (mode) and columns (backend). The chord letters are c/p
+// for the rows and l/o for the columns, so a blind `a c l` etc. lands a cell.
+const (
+	pickCoding = iota
+	pickPlanning
+)
+
+const (
+	pickClaude = iota
+	pickCodex
+)
+
+// pickerTools maps the backend column to its tool.
+var pickerTools = []agentreg.Tool{agentreg.ToolClaude, agentreg.ToolCodex}
+
 // editStatuses are the statuses the status field cycles through when editing.
 var editStatuses = []string{"open", "in_progress", "blocked", "closed"}
 
@@ -113,6 +141,7 @@ type (
 		err error
 	}
 	editSavedMsg  struct{ err error }
+	deletedMsg    struct{ err error }
 	agentEventMsg struct{}
 	spawnedMsg    struct{ err error }
 	interveneMsg  struct{ err error }
@@ -127,6 +156,10 @@ type (
 	linkedMsg struct {
 		refs []string // task issue URLs confirmed linked as sub-issues
 		err  error
+	}
+	regLoadedMsg struct {
+		records []agentreg.Record
+		alive   map[string]bool
 	}
 )
 
@@ -150,6 +183,7 @@ func New(dir string) model {
 	cfg, cfgPath, _ := config.Load(dir)
 	mgr := agent.New(dir, "claude", cfg.MaxAgents)
 	mgr.Sweep() // clear scratch from any prior crashed run
+	reg := agentreg.New(dir)
 
 	var modTime time.Time
 	if fi, err := os.Stat(cfgPath); err == nil {
@@ -168,6 +202,7 @@ func New(dir string) model {
 		cfgPath:    cfgPath,
 		cfgModTime: modTime,
 		mgr:        mgr,
+		reg:        reg,
 		subLinked:  map[string]bool{},
 	}
 }
@@ -175,7 +210,7 @@ func New(dir string) model {
 func (m model) Init() tea.Cmd {
 	// The post-load fingerprint from hydrateCmd seeds the watcher baseline, so no
 	// independent fpCmd here; the hydrate handler kicks off the GitHub push.
-	return tea.Batch(m.spinner.Tick, m.hydrateCmd(), tickCmd(), m.waitAgentEvent())
+	return tea.Batch(m.spinner.Tick, m.hydrateCmd(), tickCmd(), m.waitAgentEvent(), m.regCmd())
 }
 
 // waitAgentEvent blocks on the manager's event channel and re-arms itself, so
@@ -305,6 +340,30 @@ func (m model) updateCmd(id, field, value string) tea.Cmd {
 	}
 }
 
+// handleConfirmDelete resolves the delete confirmation prompt: y deletes, any
+// other key cancels.
+func (m model) handleConfirmDelete(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	id := m.pendingDelete
+	m.pendingDelete = ""
+	if msg.String() != "y" {
+		return m, nil
+	}
+	m.loading = true
+	return m, tea.Batch(m.spinner.Tick, m.deleteCmd(id))
+}
+
+// deleteCmd removes a bead via `bd delete`, cascading to child tasks when the
+// target is an epic. The UI confirmation is the safety, so --force is passed.
+func (m model) deleteCmd(id string) tea.Cmd {
+	client := m.client
+	cascade := m.graph != nil && m.graph.Issues[id].IsEpic()
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		return deletedMsg{err: client.Delete(ctx, id, cascade)}
+	}
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -338,12 +397,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		m.reloadConfigIfChanged()
 		m.mgr.PruneRecent(time.Duration(m.cfg.RecentTTLSecs) * time.Second)
-		return m, tea.Batch(m.fpCmd(), tickCmd())
+		return m, tea.Batch(m.fpCmd(), tickCmd(), m.regCmd())
 
 	case agentEventMsg:
 		m.clampAgentCursor()
 		m.resizeDetail() // tab bar appearing/disappearing shifts the right pane
-		return m, m.waitAgentEvent()
+		return m, tea.Batch(m.waitAgentEvent(), m.regCmd())
 
 	case spawnedMsg:
 		if msg.err != nil {
@@ -376,6 +435,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m.startReload() // reflect the saved change; hydrate then pushes it up
 
+	case deletedMsg:
+		if msg.err != nil {
+			m.loading = false
+			m.notice = msg.err.Error()
+			return m, nil
+		}
+		return m.startReload() // drop the deleted bead and reclamp cursors
+
 	case pushedMsg:
 		m.loading = false // held since hydratedMsg while the push ran
 		if msg.err != nil {
@@ -386,6 +453,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.fp = msg.fp // absorb the push's own writes so it doesn't self-trigger
 		}
 		return m, m.linkSubIssuesCmd() // mirror the epic→task hierarchy as sub-issues
+
+	case regLoadedMsg:
+		m.agentRecords, m.agentAlive = msg.records, msg.alive
+		return m, nil
 
 	case linkedMsg:
 		for _, ref := range msg.refs {
@@ -428,6 +499,12 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	if m.searching {
 		return m.handleSearchKey(msg)
+	}
+	if m.pickerOpen {
+		return m.handlePickerKey(msg)
+	}
+	if m.pendingDelete != "" {
+		return m.handleConfirmDelete(msg)
 	}
 	m.notice = "" // any key dismisses a transient notice
 	switch msg.String() {
@@ -472,8 +549,11 @@ func (m model) handleLeftKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.startSearch(scopeEpics)
 	case "a":
 		if id := m.currentEpic(); id != "" {
-			m.tab = tabAgents
-			return m, m.spawnCmd(id, "epic")
+			m.openPicker(id, "epic")
+		}
+	case "d":
+		if id := m.currentEpic(); id != "" {
+			m.pendingDelete = id
 		}
 	case "A":
 		m.tab = tabAgents
@@ -532,8 +612,13 @@ func (m model) handleRightKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "a":
 		if m.section == secTasks {
 			if id := m.currentTask(); id != "" {
-				m.tab = tabAgents
-				return m, m.spawnCmd(id, "task")
+				m.openPicker(id, "task")
+			}
+		}
+	case "d":
+		if m.section == secTasks {
+			if id := m.currentTask(); id != "" {
+				m.pendingDelete = id
 			}
 		}
 	case "enter", "l", "right":
@@ -576,8 +661,11 @@ func (m model) handleTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "a":
 		if id := m.target(); id != "" {
-			m.tab = tabAgents
-			return m, m.spawnCmd(id, "task")
+			m.openPicker(id, "task")
+		}
+	case "d":
+		if id := m.target(); id != "" {
+			m.pendingDelete = id
 		}
 	case "up", "k":
 		m.detail.ScrollUp(1)
@@ -601,6 +689,16 @@ func (m *model) closeTask() {
 	m.section = secTasks
 	m.resizeDetail()
 	m.syncDetail()
+}
+
+// openPicker arms the launcher matrix for a bead, defaulting to the coding+claude
+// cell so `a` then enter is the common path.
+func (m *model) openPicker(target, scope string) {
+	m.pickerOpen = true
+	m.pickerTarget = target
+	m.pickerScope = scope
+	m.pickerMode = pickCoding
+	m.pickerBackend = pickClaude
 }
 
 // startSearch opens an incremental fuzzy filter over the given list scope.
