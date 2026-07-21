@@ -66,8 +66,10 @@ jobs:
           fi
 
           gh project item-add "$NUMBER" --owner "$OWNER" --url "$ISSUE_URL" >/dev/null 2>&1 || true
+          # Match by issue URL, not number: issue numbers collide across the
+          # repos this board aggregates (every repo has a #1).
           item_id=$(gh project item-list "$NUMBER" --owner "$OWNER" --format json --limit 200 \
-            | jq -r --argjson n "$ISSUE_NUMBER" '.items[] | select(.content.number==$n) | .id')
+            | jq -r --arg u "$ISSUE_URL" '.items[] | select(.content.url==$u) | .id')
 
           gh project item-edit --id "$item_id" --project-id "$project_id" \
             --field-id "$field_id" --single-select-option-id "$option_id"
