@@ -5,10 +5,13 @@ name: beads → project status
 # workflow reflects that into the board's Status column, which GitHub's no-code
 # automations cannot do (they have no "label → single-select" rule).
 #
+# Auth: a GitHub App (installed on the owner, Projects read/write) is exchanged
+# for a short-lived installation token at runtime — nothing to rotate. The
+# built-in GITHUB_TOKEN cannot write org/user Projects v2.
+#
 # Setup (until these exist the job self-skips):
-#   - repo variables BEADS_PROJECT_OWNER and BEADS_PROJECT_NUMBER
-#   - secret PROJECTS_TOKEN: a PAT with `project` scope (the built-in
-#     GITHUB_TOKEN cannot write org/user Projects v2)
+#   - repo variables BEADS_PROJECT_OWNER, BEADS_PROJECT_NUMBER, BEADS_APP_ID
+#   - secret BEADS_APP_PRIVATE_KEY: the App's private key (full PEM)
 # The board just needs a single-select "Status" field; option names matched:
 # Done (closed), In Progress (status::in_progress), Blocked (status::blocked,
 # falls back to In Progress if absent), Todo (otherwise).
@@ -22,17 +25,25 @@ concurrency:
 
 jobs:
   status:
-    if: ${{ vars.BEADS_PROJECT_NUMBER != '' }}
+    if: ${{ vars.BEADS_PROJECT_NUMBER != '' && vars.BEADS_APP_ID != '' }}
     runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
-      OWNER: ${{ vars.BEADS_PROJECT_OWNER }}
-      NUMBER: ${{ vars.BEADS_PROJECT_NUMBER }}
-      ISSUE_NUMBER: ${{ github.event.issue.number }}
-      ISSUE_URL: ${{ github.event.issue.html_url }}
-      ISSUE_STATE: ${{ github.event.issue.state }}
     steps:
+      - name: Mint a GitHub App installation token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.BEADS_APP_ID }}
+          private-key: ${{ secrets.BEADS_APP_PRIVATE_KEY }}
+          owner: ${{ vars.BEADS_PROJECT_OWNER }}
+
       - name: Reflect status label into board Status column
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          OWNER: ${{ vars.BEADS_PROJECT_OWNER }}
+          NUMBER: ${{ vars.BEADS_PROJECT_NUMBER }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+          ISSUE_STATE: ${{ github.event.issue.state }}
         run: |
           set -euo pipefail
 
