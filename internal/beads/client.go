@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
@@ -82,6 +83,65 @@ func (c *Client) Load(ctx context.Context) (map[string]Issue, error) {
 	return byID, nil
 }
 
+// Ready returns the issues that are ready to work — open with no active
+// blockers — via `bd ready --json`, which emits a single JSON array rather than
+// export's line-delimited objects. Untrusted text fields are sanitized here, as
+// in Load, so no downstream consumer has to.
+func (c *Client) Ready(ctx context.Context) ([]Issue, error) {
+	cmd := exec.CommandContext(ctx, "bd", "ready", "--json")
+	cmd.Dir = c.Dir
+	out, err := cmd.Output()
+	if err != nil {
+		stderr := ""
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			stderr = sanitize(strings.TrimSpace(string(ee.Stderr)))
+		}
+		return nil, fmt.Errorf("bd ready: %w: %s", err, stderr)
+	}
+
+	var issues []Issue
+	if err := json.Unmarshal(out, &issues); err != nil {
+		return nil, fmt.Errorf("decode bd ready: %w", err)
+	}
+	for i := range issues {
+		issues[i].Title = sanitize(issues[i].Title)
+		issues[i].Description = sanitize(issues[i].Description)
+		issues[i].Notes = sanitize(issues[i].Notes)
+		for j, l := range issues[i].Labels {
+			issues[i].Labels[j] = sanitize(l)
+		}
+	}
+	return issues, nil
+}
+
+// Comments returns an issue's activity timeline, oldest first, via
+// `bd comments <id> --json`. Untrusted text is sanitized here, as in Load, so no
+// downstream consumer has to.
+func (c *Client) Comments(ctx context.Context, id string) ([]Comment, error) {
+	cmd := exec.CommandContext(ctx, "bd", "comments", id, "--json")
+	cmd.Dir = c.Dir
+	out, err := cmd.Output()
+	if err != nil {
+		stderr := ""
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			stderr = sanitize(strings.TrimSpace(string(ee.Stderr)))
+		}
+		return nil, fmt.Errorf("bd comments: %w: %s", err, stderr)
+	}
+
+	var comments []Comment
+	if err := json.Unmarshal(out, &comments); err != nil {
+		return nil, fmt.Errorf("decode bd comments: %w", err)
+	}
+	for i := range comments {
+		comments[i].Text = sanitize(comments[i].Text)
+		comments[i].Author = sanitize(comments[i].Author)
+	}
+	return comments, nil
+}
+
 // Update persists a single field change via `bd update <id> --<field> <value>`.
 // The value is passed as one argv element (no shell), so multi-line description
 // and notes need no escaping or temp file.
@@ -106,6 +166,17 @@ func (c *Client) Delete(ctx context.Context, id string, cascade bool) error {
 	cmd.Dir = c.Dir
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("bd delete: %w: %s", err, sanitize(strings.TrimSpace(string(out))))
+	}
+	return nil
+}
+
+// Comment appends a comment to an issue via `bd comment <id> <body>`. The body
+// is passed as one argv element (no shell), so multi-line text needs no escaping.
+func (c *Client) Comment(ctx context.Context, id, body string) error {
+	cmd := exec.CommandContext(ctx, "bd", "comment", id, body)
+	cmd.Dir = c.Dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("bd comment: %w: %s", err, sanitize(strings.TrimSpace(string(out))))
 	}
 	return nil
 }
