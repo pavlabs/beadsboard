@@ -16,6 +16,16 @@ type Issue struct {
 	ExternalRef  string   `json:"external_ref"` // cross-system link, e.g. "gh-42"; set once synced
 }
 
+// Comment is one entry on an issue's activity timeline, as emitted by
+// `bd comments <id> --json`.
+type Comment struct {
+	ID        string `json:"id"`
+	IssueID   string `json:"issue_id"`
+	Author    string `json:"author"`
+	Text      string `json:"text"`
+	CreatedAt string `json:"created_at"`
+}
+
 // Dep is one dependency edge: this issue depends on DependsOnID. Type is
 // "blocks" (DependsOnID must close first) or "parent-child" (DependsOnID is
 // this issue's epic).

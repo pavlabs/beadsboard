@@ -59,10 +59,14 @@ type model struct {
 	agentRecords []agentreg.Record  // last registry snapshot, read off the render path
 	agentAlive   map[string]bool    // liveness per record ID, computed with the snapshot
 
-	tab         int  // tabDetails | tabAgents
-	agentCursor int  // selected agent in the Agents tab
-	showAll     bool // Agents tab: all agents vs scoped to the hovered epic
-	notice      string
+	commentBead string          // bead the cached comments belong to; "" = none
+	comments    []beads.Comment // selected bead's activity timeline, read off the render path
+
+	tab             int  // tabDetails | tabAgents
+	agentCursor     int  // selected agent in the Agents tab
+	beadAgentCursor int  // selected row in a task detail page's per-bead agents ledger
+	showAll         bool // Agents tab: all agents vs scoped to the hovered epic
+	notice          string
 
 	pendingDelete string // bead id awaiting a delete confirmation; "" = none
 
@@ -100,9 +104,13 @@ const (
 	sectionCount
 )
 
+// secAgents is the task detail page's per-bead agents ledger. A task has no
+// subtasks, so it reuses the slot the epic spends on its task-list section.
+const secAgents = secTasks
+
 // taskSectionCount is how many sections a task's detail page cycles through: the
-// same fields as an epic minus the task-list section (a task has no subtasks).
-const taskSectionCount = secTasks
+// epic's fields plus the agents-ledger section in place of the task list.
+const taskSectionCount = secAgents + 1
 
 // Search scopes: which list an active query filters.
 const (
@@ -161,6 +169,10 @@ type (
 		records []agentreg.Record
 		alive   map[string]bool
 	}
+	commentsLoadedMsg struct {
+		bead     string
+		comments []beads.Comment
+	}
 )
 
 // newInputs builds the title and description/notes editors with their shared
@@ -181,8 +193,10 @@ func New(dir string) model {
 	ti, ta, se := newInputs()
 
 	cfg, cfgPath, _ := config.Load(dir)
+	client := beads.NewClient(dir)
 	mgr := agent.New(dir, "claude", cfg.MaxAgents)
-	mgr.Sweep() // clear scratch from any prior crashed run
+	mgr.SetCommenter(client) // agents post lifecycle milestones onto the bead's timeline
+	mgr.Sweep()              // clear scratch from any prior crashed run
 	reg := agentreg.New(dir)
 
 	var modTime time.Time
@@ -191,7 +205,7 @@ func New(dir string) model {
 	}
 
 	return model{
-		client:     beads.NewClient(dir),
+		client:     client,
 		loading:    true,
 		spinner:    sp,
 		detail:     viewport.New(0, 0),
@@ -210,7 +224,7 @@ func New(dir string) model {
 func (m model) Init() tea.Cmd {
 	// The post-load fingerprint from hydrateCmd seeds the watcher baseline, so no
 	// independent fpCmd here; the hydrate handler kicks off the GitHub push.
-	return tea.Batch(m.spinner.Tick, m.hydrateCmd(), tickCmd(), m.waitAgentEvent(), m.regCmd())
+	return tea.Batch(m.spinner.Tick, m.hydrateCmd(), tickCmd(), m.waitAgentEvent(), m.regCmd(), m.commentsCmd())
 }
 
 // waitAgentEvent blocks on the manager's event channel and re-arms itself, so
@@ -250,6 +264,26 @@ func (m model) fpCmd() tea.Cmd {
 
 func tickCmd() tea.Cmd {
 	return tea.Tick(refreshInterval, func(time.Time) tea.Msg { return tickMsg{} })
+}
+
+// commentsCmd reads the selected bead's activity timeline off the UI goroutine,
+// so the render path only touches the cached result. It follows the current
+// target (hovered epic or drilled-into task); no target means nothing to fetch.
+func (m model) commentsCmd() tea.Cmd {
+	bead := m.target()
+	if bead == "" {
+		return nil
+	}
+	client := m.client
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		comments, err := client.Comments(ctx, bead)
+		if err != nil {
+			return commentsLoadedMsg{bead: bead} // unreadable timeline reads as empty
+		}
+		return commentsLoadedMsg{bead: bead, comments: comments}
+	}
 }
 
 // startReload flips to the loading state and kicks off a fresh hydrate.
@@ -397,10 +431,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		m.reloadConfigIfChanged()
 		m.mgr.PruneRecent(time.Duration(m.cfg.RecentTTLSecs) * time.Second)
-		return m, tea.Batch(m.fpCmd(), tickCmd(), m.regCmd())
+		return m, tea.Batch(m.fpCmd(), tickCmd(), m.regCmd(), m.commentsCmd())
 
 	case agentEventMsg:
 		m.clampAgentCursor()
+		m.clampBeadAgentCursor()
 		m.resizeDetail() // tab bar appearing/disappearing shifts the right pane
 		return m, tea.Batch(m.waitAgentEvent(), m.regCmd())
 
@@ -456,6 +491,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case regLoadedMsg:
 		m.agentRecords, m.agentAlive = msg.records, msg.alive
+		m.clampBeadAgentCursor()
+		return m, nil
+
+	case commentsLoadedMsg:
+		m.commentBead, m.comments = msg.bead, msg.comments
+		m.renderFields() // fold the refreshed timeline into the details region
 		return m, nil
 
 	case linkedMsg:
@@ -656,7 +697,7 @@ func (m model) handleTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.section = (m.section - 1 + taskSectionCount) % taskSectionCount
 		m.syncDetail()
 	case "e":
-		if !m.loading {
+		if !m.loading && m.section != secAgents {
 			m.beginEdit()
 		}
 	case "a":
@@ -667,10 +708,25 @@ func (m model) handleTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if id := m.target(); id != "" {
 			m.pendingDelete = id
 		}
+	case "x":
+		// x kills the focused ledger agent; the vim-movement keys stay
+		// non-destructive so k can't terminate an agent by accident.
+		if m.section == secAgents {
+			m.killBeadAgent()
+			return m, m.regCmd()
+		}
 	case "up", "k":
-		m.detail.ScrollUp(1)
+		if m.section == secAgents {
+			m.moveBeadAgent(-1)
+		} else {
+			m.detail.ScrollUp(1)
+		}
 	case "down", "j":
-		m.detail.ScrollDown(1)
+		if m.section == secAgents {
+			m.moveBeadAgent(1)
+		} else {
+			m.detail.ScrollDown(1)
+		}
 	}
 	return m, nil
 }
@@ -679,6 +735,7 @@ func (m model) handleTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *model) openTask() {
 	m.taskOpen = true
 	m.section = secTitle
+	m.beadAgentCursor = 0
 	m.resizeDetail()
 	m.syncDetail()
 }
@@ -687,6 +744,7 @@ func (m *model) openTask() {
 func (m *model) closeTask() {
 	m.taskOpen = false
 	m.section = secTasks
+	m.beadAgentCursor = 0
 	m.resizeDetail()
 	m.syncDetail()
 }

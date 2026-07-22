@@ -12,7 +12,85 @@ import (
 
 	"github.com/pavlabs/beadsboard/internal/agent"
 	"github.com/pavlabs/beadsboard/internal/agentreg"
+	"github.com/pavlabs/beadsboard/internal/beads"
 )
+
+// k on the focused ledger row for a beadsboard-owned agent routes through the
+// Manager's dismissal path, removing it from the manager.
+func TestKillBeadAgentInternalDismisses(t *testing.T) {
+	repo := gitRepoUI(t)
+	mgr := agent.New(repo, stubSleepClaude(t), 10)
+	view, err := mgr.Spawn(agent.Spec{IssueID: "a", Scope: "epic", RepoDir: repo})
+	require.NoError(t, err)
+	t.Cleanup(func() { mgr.Kill(view.ID) })
+
+	m := testModel()
+	m.mgr = mgr
+	for m.epicCursor < 5 && m.currentEpic() != "a" {
+		m.epicCursor++
+	}
+	require.Equal(t, "a", m.target(), "target is the epic the agent runs on")
+	m.beadAgentCursor = 0
+
+	m.killBeadAgent()
+	require.Empty(t, m.mgr.Snapshot(), "dismiss drops the owned agent")
+}
+
+// k on the focused ledger row for an external record routes through the registry:
+// it signals the PID and drops the record.
+func TestKillBeadAgentExternalSignalsAndDrops(t *testing.T) {
+	proc := exec.Command("sleep", "30")
+	require.NoError(t, proc.Start())
+	t.Cleanup(func() { _ = proc.Process.Kill() })
+
+	reg := agentreg.New(t.TempDir())
+	rec := agentreg.Record{ID: "ext-1", BeadID: "a", Tool: agentreg.ToolClaude, Mode: agentreg.ModePlanning, Source: agentreg.SourceExternal, PID: proc.Process.Pid, StartedAt: time.Now()}
+	require.NoError(t, reg.Put(rec))
+
+	m := testModel()
+	m.reg = reg
+	m.agentRecords = []agentreg.Record{rec}
+	m.agentAlive = map[string]bool{"ext-1": true}
+	for m.epicCursor < 5 && m.currentEpic() != "a" {
+		m.epicCursor++
+	}
+	require.Equal(t, "a", m.target())
+	m.beadAgentCursor = 0
+
+	m.killBeadAgent()
+
+	got, err := reg.List()
+	require.NoError(t, err)
+	require.Empty(t, got, "registry Kill drops the record after signalling")
+	require.Error(t, proc.Wait(), "the signalled process exits non-zero")
+}
+
+// The Details view folds in the selected bead's cached activity timeline.
+func TestDetailsRendersTimeline(t *testing.T) {
+	m := testModel()
+	for m.epicCursor < 5 && m.currentEpic() != "a" {
+		m.epicCursor++
+	}
+	m.commentBead = "a"
+	m.comments = []beads.Comment{
+		{Author: "art", Text: "kicked off", CreatedAt: "2026-07-22T18:54:54Z"},
+		{Author: "bot", Text: "bb-agent spawn agent=a-1", CreatedAt: "2026-07-22T18:55:00Z"},
+	}
+	out := m.fields("a", 80)
+	require.Contains(t, out, "ACTIVITY")
+	require.Contains(t, out, "kicked off")
+	require.Contains(t, out, "bb-agent spawn agent=a-1")
+
+	// A timeline cached for a different bead does not leak into this one.
+	m.commentBead = "b"
+	require.NotContains(t, m.fields("a", 80), "ACTIVITY")
+}
+
+// shortTime compacts an RFC3339 stamp and passes through anything it can't parse.
+func TestShortTime(t *testing.T) {
+	require.Equal(t, "unparseable", shortTime("unparseable"))
+	require.NotContains(t, shortTime("2026-07-22T18:54:54Z"), "T", "parsed stamps drop the RFC3339 T")
+}
 
 // a on a hovered epic arms the launcher matrix for that bead rather than
 // spawning directly; it does not switch tabs until a cell is dispatched.
