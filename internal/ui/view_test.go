@@ -309,8 +309,8 @@ func TestTaskDetailEditTargetsTask(t *testing.T) {
 	require.Equal(t, "design", m.input.Value(), "edits the task title, not the epic's")
 }
 
-// Tab in a task's detail page cycles the five fields and wraps, never reaching
-// the task-list section (a task has no subtasks).
+// Tab in a task's detail page cycles the fields plus the agents ledger and
+// wraps; a task has no subtasks, so the task-list slot is the agents ledger.
 func TestTaskDetailTabCycle(t *testing.T) {
 	m := testModel()
 	m.focused = true
@@ -320,11 +320,10 @@ func TestTaskDetailTabCycle(t *testing.T) {
 	m = next.(model)
 	require.Equal(t, secTitle, m.section)
 
-	for _, want := range []int{secStatus, secPriority, secDescription, secNotes, secTitle} {
+	for _, want := range []int{secStatus, secPriority, secDescription, secNotes, secAgents, secTitle} {
 		next, _ = m.handleKey(keyMsg("tab"))
 		m = next.(model)
 		require.Equal(t, want, m.section)
-		require.NotEqual(t, secTasks, m.section)
 	}
 }
 

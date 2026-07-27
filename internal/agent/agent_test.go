@@ -1,15 +1,36 @@
 package agent
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 )
+
+// fakeCommenter records the bead-activity comments a Manager posts.
+type fakeCommenter struct {
+	mu    sync.Mutex
+	posts []string // "<beadID> <body>"
+}
+
+func (f *fakeCommenter) Comment(_ context.Context, id, body string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.posts = append(f.posts, id+" "+body)
+	return nil
+}
+
+func (f *fakeCommenter) all() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.posts...)
+}
 
 // gitRepo makes a throwaway repo with one commit so worktrees can be added.
 func gitRepo(t *testing.T) string {
@@ -92,6 +113,30 @@ func TestSpawnDoneCapturesSessionAndCleansWorktree(t *testing.T) {
 	// the removal rather than racing it.
 	require.Eventually(t, func() bool { return liveWorktrees(t, repo) == 0 },
 		2*time.Second, 20*time.Millisecond, "worktree removed on clean exit")
+}
+
+// A configured commenter receives spawn, session, and finish milestones on the
+// bead's timeline, each with the parseable bb-agent prefix.
+func TestSpawnPostsLifecycleComments(t *testing.T) {
+	repo := gitRepo(t)
+	bin := stubClaude(
+		t,
+		`{"type":"system","subtype":"init","session_id":"sess-123"}`,
+		`{"type":"result","result":"All done."}`,
+	)
+	m := newAt(repo, bin, 10, t.TempDir())
+	fc := &fakeCommenter{}
+	m.SetCommenter(fc)
+
+	_, err := m.Spawn(Spec{IssueID: "epic-x", Scope: "epic", Prompt: "go", PermissionMode: "acceptEdits"})
+	require.NoError(t, err)
+	waitTerminal(t, m)
+
+	require.Eventually(t, func() bool { return len(fc.all()) >= 3 }, 5*time.Second, 20*time.Millisecond)
+	joined := strings.Join(fc.all(), "\n")
+	require.Contains(t, joined, "epic-x bb-agent spawn agent=epic-x-1 tool=claude mode=coding branch=beadsboard/epic-x-1")
+	require.Contains(t, joined, "epic-x bb-agent session agent=epic-x-1 session=sess-123")
+	require.Contains(t, joined, "epic-x bb-agent finish agent=epic-x-1 status=done result=All done.")
 }
 
 // A run that ends with the marker becomes NeedsInput, keeps its question, and

@@ -348,6 +348,39 @@ func (m *model) clampAgentCursor() {
 	m.agentCursor = min(max(m.agentCursor, 0), max(n-1, 0))
 }
 
+// moveBeadAgent moves the cursor over the current bead's agents ledger, clamped
+// to the row count.
+func (m *model) moveBeadAgent(d int) {
+	n := len(m.beadAgents(m.target()))
+	if n == 0 {
+		return
+	}
+	m.beadAgentCursor = min(max(m.beadAgentCursor+d, 0), n-1)
+}
+
+func (m *model) clampBeadAgentCursor() {
+	n := len(m.beadAgents(m.target()))
+	m.beadAgentCursor = min(max(m.beadAgentCursor, 0), max(n-1, 0))
+}
+
+// killBeadAgent terminates the focused row of the current bead's agents ledger:
+// a beadsboard-owned agent goes through the Manager's dismissal path, an
+// external or planning record through the registry (PID signal + record drop).
+// Both end with the record gone; the caller refreshes the ledger.
+func (m *model) killBeadAgent() {
+	rows := m.beadAgents(m.target())
+	if m.beadAgentCursor < 0 || m.beadAgentCursor >= len(rows) {
+		return
+	}
+	row := rows[m.beadAgentCursor]
+	if row.internal {
+		m.mgr.Dismiss(row.id)
+	} else if m.reg != nil {
+		_ = m.reg.Kill(row.id)
+	}
+	m.clampBeadAgentCursor()
+}
+
 func (m model) hasAgents() bool { return len(m.mgr.Snapshot()) > 0 }
 
 func (m model) anyNeedsInput() bool {
@@ -737,16 +770,30 @@ func (m model) beadAgents(beadID string) []agentRow {
 	return append(active, recent...)
 }
 
-// beadAgentGlyph is the liveness marker: an internal row reuses the status glyph,
-// an external one shows a live/idle dot from its cached liveness.
-func beadAgentGlyph(r agentRow) string {
+// beadAgentMark is the uncoloured liveness rune, for use inside the selected-row
+// highlight (whose background an inner colour reset would otherwise break).
+func beadAgentMark(r agentRow) string {
 	if r.internal {
 		return agentGlyph(r.view.Status)
 	}
 	if r.alive {
-		return lipgloss.NewStyle().Foreground(green).Render("◐")
+		return "◐"
 	}
-	return dimStyle.Render("·")
+	return "·"
+}
+
+// beadAgentGlyph is the liveness marker: an internal row reuses the status glyph,
+// an external one shows a live/idle dot from its cached liveness.
+func beadAgentGlyph(r agentRow) string {
+	mark := beadAgentMark(r)
+	switch {
+	case r.internal:
+		return mark
+	case r.alive:
+		return lipgloss.NewStyle().Foreground(green).Render(mark)
+	default:
+		return dimStyle.Render(mark)
+	}
 }
 
 // renderBeadAgents is a compact read-only ledger of every agent working a bead:
@@ -763,9 +810,16 @@ func (m model) renderBeadAgents(rows []agentRow, width, height int) string {
 	if len(rows) > limit {
 		rows = rows[:limit]
 	}
-	for _, r := range rows {
-		prefix := fmt.Sprintf("%s %-8s ", beadAgentGlyph(r), shortID(r.id))
+	focused := m.taskOpen && m.section == secAgents
+	for i, r := range rows {
+		id := shortID(r.id)
 		cols := fmt.Sprintf("%-7s %-8s %-9s %s", r.tool, r.mode, r.source, r.statusWord)
+		if focused && i == m.beadAgentCursor {
+			line := fmt.Sprintf("%s %-8s %s", beadAgentMark(r), id, cols)
+			b.WriteString("\n" + selectedStyle.Width(width).Render(truncate(line, width)))
+			continue
+		}
+		prefix := fmt.Sprintf("%s %-8s ", beadAgentGlyph(r), id)
 		colW := max(width-lipgloss.Width(prefix), 4)
 		b.WriteString("\n" + prefix + dimStyle.Render(truncate(cols, colW)))
 	}
