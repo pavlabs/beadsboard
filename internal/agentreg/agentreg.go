@@ -63,6 +63,20 @@ func (r Record) Alive() bool {
 	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
+// Signal sends sig to the recorded process, so beadsboard can control agents it
+// never spawned. A non-positive PID or an already-exited process (ESRCH) is not an
+// error — there is nothing left to signal; other failures (e.g. EPERM) are returned.
+func (r Record) Signal(sig syscall.Signal) error {
+	if r.PID <= 0 {
+		return nil
+	}
+	err := syscall.Kill(r.PID, sig)
+	if err == nil || errors.Is(err, syscall.ESRCH) {
+		return nil
+	}
+	return err
+}
+
 // Registry is the agents directory for one beads project.
 type Registry struct {
 	dir string
@@ -168,6 +182,28 @@ func (r *Registry) Reap() (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// Kill signals the recorded process to terminate (SIGTERM) and deregisters it, so
+// beadsboard can stop an agent it never spawned by its recorded PID. Idempotent: a
+// missing record or an already-exited process is not an error. A failure to signal
+// (e.g. EPERM) leaves the record in place rather than deregistering blindly.
+func (r *Registry) Kill(id string) error {
+	b, err := os.ReadFile(r.path(id))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var rec Record
+	if err := json.Unmarshal(b, &rec); err != nil {
+		return err
+	}
+	if err := rec.Signal(syscall.SIGTERM); err != nil {
+		return err
+	}
+	return r.Remove(id)
 }
 
 func (r *Registry) path(id string) string { return filepath.Join(r.dir, id+".json") }

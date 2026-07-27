@@ -105,6 +105,13 @@ func (a *agent) push(s string) {
 	a.Summary = s
 }
 
+// Commenter posts a comment to a bead. beads.Client satisfies it; the Manager
+// records agent lifecycle milestones on the bead's timeline through it, so the
+// interface lives consumer-side and keeps agent decoupled from the beads package.
+type Commenter interface {
+	Comment(ctx context.Context, id, body string) error
+}
+
 // Manager owns all running agents and the worktree/log scratch space. It is safe
 // for concurrent use; the UI reads snapshots and reacts to Events.
 type Manager struct {
@@ -118,6 +125,7 @@ type Manager struct {
 	agents    []*agent
 	events    chan struct{}
 	reg       *agentreg.Registry // shared .beadsboard/agents registry; nil if unavailable
+	commenter Commenter          // posts lifecycle milestones to the bead; nil disables it
 }
 
 // New builds a Manager for repoDir. claudeBin is the Claude Code executable
@@ -164,6 +172,21 @@ func (m *Manager) regReap() {
 	if m.reg != nil {
 		_, _ = m.reg.Reap()
 	}
+}
+
+// SetCommenter wires the sink for bead-activity comments. Optional: a nil
+// commenter (the default) silently disables timeline posting.
+func (m *Manager) SetCommenter(c Commenter) { m.commenter = c }
+
+// comment posts a bead-activity line best-effort, off the caller's goroutine, so
+// an agent's lifecycle never blocks on or fails because of a comment error.
+func (m *Manager) comment(beadID, body string) {
+	if m.commenter == nil || beadID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_ = m.commenter.Comment(ctx, beadID, body)
 }
 
 // Events fires whenever agent state changes in a way the UI should reflect.
@@ -279,6 +302,7 @@ func (m *Manager) Spawn(spec Spec) (View, error) {
 	rec := a.rec
 	m.mu.Unlock()
 	m.regPut(rec)
+	go m.comment(rec.BeadID, spawnComment(rec))
 
 	go m.run(a, stdout, logFile, logPath)
 	m.ping()
@@ -331,6 +355,7 @@ func (m *Manager) ingest(a *agent, line []byte) {
 	// Persist the session id once, so a rediscovered agent stays resumable.
 	if captured.ID != "" {
 		m.regPut(captured)
+		go m.comment(captured.BeadID, sessionComment(captured))
 	}
 }
 
@@ -358,11 +383,13 @@ func (m *Manager) finalize(a *agent, waitErr error, logPath string) {
 		a.worktreePresent = false
 	}
 	wt, repoDir, id := a.worktree, a.repoDir, a.ID
+	beadID, status, result := a.IssueID, a.Status, a.pendingResult
 	m.mu.Unlock()
 
 	// The headless process has exited, so drop its registry record regardless of
 	// outcome; a needs-input agent stays visible via the in-memory Snapshot.
 	m.regRemove(id)
+	go m.comment(beadID, finishComment(id, status, result))
 	_ = os.Remove(logPath) // logs are ephemeral; the question/outcome is kept in memory
 	if !keep {
 		m.removeWorktree(repoDir, wt)
@@ -509,6 +536,49 @@ func shortIssue(id string) string {
 		return "agent"
 	}
 	return b.String()
+}
+
+// label is the lifecycle word used in bead-activity comments.
+func (s Status) label() string {
+	switch s {
+	case Running:
+		return "running"
+	case NeedsInput:
+		return "needs-input"
+	case Intervened:
+		return "intervened"
+	case Done:
+		return "done"
+	case Failed:
+		return "failed"
+	case Killed:
+		return "killed"
+	}
+	return "unknown"
+}
+
+// commentTag prefixes every bead-activity comment so a timeline can be parsed
+// back out later: `bb-agent <verb> key=value …`.
+const commentTag = "bb-agent"
+
+func spawnComment(rec agentreg.Record) string {
+	body := fmt.Sprintf("%s spawn agent=%s tool=%s mode=%s", commentTag, rec.ID, rec.Tool, rec.Mode)
+	if rec.Branch != "" {
+		body += " branch=" + rec.Branch
+	}
+	return body
+}
+
+func sessionComment(rec agentreg.Record) string {
+	return fmt.Sprintf("%s session agent=%s session=%s", commentTag, rec.ID, rec.SessionID)
+}
+
+func finishComment(id string, status Status, result string) string {
+	body := fmt.Sprintf("%s finish agent=%s status=%s", commentTag, id, status.label())
+	if r := firstLine(result); r != "" {
+		body += " result=" + r
+	}
+	return body
 }
 
 func firstLine(s string) string {

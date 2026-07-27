@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 
@@ -121,6 +122,8 @@ func (m model) footerLine() string {
 		default:
 			keys = "ctrl+s save · esc cancel · enter = newline"
 		}
+	case m.taskOpen && m.section == secAgents:
+		keys = "↑/↓ select · x kill · tab field · esc back · q quit"
 	case m.taskOpen:
 		keys = "tab field · e edit · ↑/↓ scroll · esc back · q quit"
 	case m.focused && m.section == secTasks:
@@ -476,7 +479,49 @@ func (m model) fields(id string, width int) string {
 		put(m.renderBeadAgents(m.beadAgents(id), width, m.detail.Height))
 	}
 
+	// The bead's activity timeline, when it's the one whose comments we've cached.
+	if m.commentBead == id && len(m.comments) > 0 {
+		put("")
+		put(m.renderTimeline(width))
+	}
+
 	return b.String()
+}
+
+// renderTimeline is a compact, read-only activity log for the selected bead: a
+// dim heading then one line per comment (short timestamp, author, first line of
+// text), each clipped to width.
+func (m model) renderTimeline(width int) string {
+	var b strings.Builder
+	b.WriteString(dimStyle.Render("ACTIVITY"))
+	for _, c := range m.comments {
+		text := firstLine(c.Text)
+		if c.Author != "" {
+			text = c.Author + " " + text
+		}
+		line := shortTime(c.CreatedAt) + "  " + text
+		b.WriteString("\n  " + dimStyle.Render(truncate(line, max(width-2, 4))))
+	}
+	return b.String()
+}
+
+// shortTime abbreviates an RFC3339 timestamp to a compact local MM-DD HH:MM,
+// falling back to the raw value if it doesn't parse.
+func shortTime(s string) string {
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t.Local().Format("01-02 15:04")
+	}
+	return s
+}
+
+// firstLine is the first non-empty line of s, trimmed — comments may be
+// multi-line but the timeline shows a single row each.
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return strings.TrimSpace(s[:i])
+	}
+	return s
 }
 
 // editShortView renders the active editor for a short field: the title text box
