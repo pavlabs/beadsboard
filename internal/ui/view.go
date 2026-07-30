@@ -85,6 +85,12 @@ func (m model) headerLine() string {
 	if m.notice != "" {
 		sub += lipgloss.NewStyle().Foreground(yellow).Render("  ⚠ " + m.notice)
 	}
+	// The badge is the only board-wide signal that something off-screen wants the
+	// user, so it rides the header rather than any one pane.
+	if n := m.attentionCount(); n > 0 && !m.inboxOpen {
+		sub += lipgloss.NewStyle().Foreground(yellow).Render(fmt.Sprintf("  ● %d need attention", n))
+		sub += dimStyle.Render(" (i)")
+	}
 	return title + sub
 }
 
@@ -104,6 +110,9 @@ func (m model) footerLine() string {
 	}
 	if m.settingsOpen {
 		return dimStyle.Render("  ↑/↓ field · ←/→ change · s save · esc cancel")
+	}
+	if m.inboxOpen {
+		return dimStyle.Render("  ↑/↓ item · enter jump to bead · o open PR · i/esc close")
 	}
 	if m.searching {
 		return "  " + dimStyle.Render("search ") + m.search.View() +
@@ -131,7 +140,7 @@ func (m model) footerLine() string {
 	case m.focused:
 		keys = "tab section · e edit · ↑/↓ scroll · esc back · q quit"
 	default:
-		keys = "↑/↓ move · → open · / search · w wrap · r refresh · q quit"
+		keys = "↑/↓ move · → open · / search · w wrap · i inbox · r refresh · q quit"
 		if m.cfg.GitHubSync {
 			keys += " · G github-pull"
 		}
@@ -147,6 +156,8 @@ func (m model) panes() string {
 	rh := m.rightInnerH()
 	var right string
 	switch {
+	case m.inboxOpen:
+		right = boxStyle.Width(rightOuter - 2).Height(rh).Render(m.inboxView(rightInner, rh))
 	case m.pickerOpen:
 		right = boxStyle.Width(rightOuter - 2).Height(rh).Render(m.pickerView(rightInner, rh))
 	case m.settingsOpen:

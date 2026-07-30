@@ -25,6 +25,11 @@ import (
 // 126-bead project), so this is deliberately slower than a filesystem stat loop.
 const refreshInterval = 2 * time.Second
 
+// pullsInterval paces the pull-request fetch. It costs a GitHub API call, which
+// is rate limited and far slower to change than local bead state, so it runs on
+// its own clock rather than with every board refresh.
+const pullsInterval = time.Minute
+
 type model struct {
 	client *beads.Client
 	graph  *beads.Graph
@@ -74,6 +79,12 @@ type model struct {
 
 	settingsOpen bool
 	setField     int // which setting the cursor is on
+
+	inboxOpen   bool // the board-wide attention inbox is capturing keys
+	inboxCursor int  // selected attention item
+
+	pulls   []beads.PullRequest // open PRs across the owner's repos, last fetch
+	pullsAt time.Time           // when that fetch landed; "" state means never
 
 	pickerOpen    bool   // the launcher matrix is capturing keys
 	pickerTarget  string // bead the launch acts on
@@ -151,6 +162,10 @@ type (
 	polledMsg struct {
 		graph *beads.Graph
 		rev   uint64
+		err   error
+	}
+	pullsLoadedMsg struct {
+		pulls []beads.PullRequest
 		err   error
 	}
 	editSavedMsg  struct{ err error }
@@ -261,6 +276,29 @@ func (m model) pollCmd() tea.Cmd {
 	return func() tea.Msg {
 		graph, rev, err := load(client)
 		return polledMsg{graph: graph, rev: rev, err: err}
+	}
+}
+
+// pullsCmd fetches the open PRs in the repos this board's beads live in. It is
+// due only when the board syncs with GitHub, at least one repo resolves, and the
+// last fetch has aged out.
+func (m model) pullsCmd() tea.Cmd {
+	if !m.cfg.GitHubSync {
+		return nil
+	}
+	if !m.pullsAt.IsZero() && time.Since(m.pullsAt) < pullsInterval {
+		return nil
+	}
+	repos := m.client.BoardRepos(m.graph, m.cfg.GitHubRepository)
+	if len(repos) == 0 {
+		return nil
+	}
+	client := m.client
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		pulls, err := client.PullRequests(ctx, repos)
+		return pullsLoadedMsg{pulls: pulls, err: err}
 	}
 }
 
@@ -454,7 +492,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		m.reloadConfigIfChanged()
 		m.mgr.PruneRecent(time.Duration(m.cfg.RecentTTLSecs) * time.Second)
-		cmds := []tea.Cmd{tickCmd(), m.regCmd(), m.commentsCmd()}
+		cmds := []tea.Cmd{tickCmd(), m.regCmd(), m.commentsCmd(), m.pullsCmd()}
 		if !m.loading {
 			// A poll shells out to bd; skip it while a load or push already holds
 			// the board, rather than contending with it for the Dolt engine.
@@ -519,6 +557,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.linkSubIssuesCmd() // mirror the epic→task hierarchy as sub-issues
 
+	case pullsLoadedMsg:
+		// Stamp the fetch either way: a GitHub outage must not turn into a retry
+		// loop against a rate-limited API.
+		m.pullsAt = time.Now()
+		if msg.err != nil {
+			m.notice = msg.err.Error()
+			return m, nil
+		}
+		m.pulls = msg.pulls
+		return m, nil
+
 	case regLoadedMsg:
 		m.agentRecords, m.agentAlive = msg.records, msg.alive
 		m.clampBeadAgentCursor()
@@ -577,6 +626,9 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.pendingDelete != "" {
 		return m.handleConfirmDelete(msg)
 	}
+	if m.inboxOpen {
+		return m.handleInboxKey(msg)
+	}
 	m.notice = "" // any key dismisses a transient notice
 	switch msg.String() {
 	case "q", "ctrl+c":
@@ -586,6 +638,9 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.startReload()
 		}
 		return m, nil
+	case "i":
+		// Board-wide, so it opens from anywhere rather than per-pane.
+		return m.openInbox()
 	}
 	if m.tab == tabAgents {
 		return m.handleAgentsKey(msg)
