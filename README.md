@@ -2,7 +2,7 @@
 
 A terminal UI for browsing and driving [beads](https://github.com/gastownhall/beads)
 (`bd`) epics and tasks — a live master–detail board with inline editing, fuzzy
-search, headless agents, and two-way GitHub sync.
+search, headless agents, an attention inbox, and two-way GitHub sync.
 
 ![beadsboard demo](docs/demo.gif)
 
@@ -29,8 +29,20 @@ beadsboard --version
   to work the task or epic and open a PR. The **Agents** tab shows each agent's live
   status; an agent that gets stuck stops and asks. `enter` resumes one in a floating
   zellij pane to intervene; `k` kills, `x` dismisses. `S` opens settings.
-- **Live refresh.** A one-second fingerprint of `.beads/` reloads the board on any
-  external `bd` write — never on the app's own reads.
+- **Attention inbox.** `i` answers one question board-wide: what is waiting on you?
+  Agents that stopped to ask, agents that errored, registered agents whose process
+  died mid-task, blocked beads, and open pull requests that need a human — one list,
+  most urgent first. `enter` jumps the board to the bead; `o` opens the PR. A badge in
+  the header counts them so nothing off-screen goes unnoticed.
+- **Pull requests across repos.** One GitHub search covers every sub-repo the board
+  actually tracks and folds the results into the same inbox, each labelled with why it wants
+  you — changes requested, checks red, conflicted, waiting on review, approved and
+  unmerged, or simply stale. PRs are matched back to their bead by the issue they close
+  (by URL, since numbers collide across repos), falling back to the agent's branch name.
+- **Live refresh.** The board polls the revision of its own `bd export` and reloads when
+  the issue data actually moves. It watches the data rather than `.beads/` file state,
+  because `bd` rewrites Dolt's journal even on reads — file watching cannot tell the
+  board's own reads from somebody else's edit.
 
 ## GitHub sync (optional plugin)
 
@@ -45,6 +57,11 @@ Projects board in step:
   issue's status onto the Projects board's Status column.
 - **`G`** pulls the other way — reads the board (or issue state + `status::` labels)
   and reconciles bead status, so a teammate moving a card flows back into bd.
+- Open pull requests feed the attention inbox, scoped to the repos the board's own
+  beads resolve to — the sub-repos behind their `repo::` labels, or
+  `github_repository` in a single-repo project — so an unrelated repo in the same org
+  never shows up. Refreshed on their own slower clock than the board, since GitHub is
+  rate limited and PRs move far less often than local beads.
 
 ## Agents on a task
 
@@ -120,6 +137,10 @@ go test ./...
 go build -o beadsboard .
 ```
 
-Stack: bubbletea + lipgloss + bubbles. `internal/beads` is the `bd` client and graph
-derivation, `internal/agent` runs the worktree-isolated headless agents, and
-`internal/ui` is the bubbletea model and rendering.
+Stack: bubbletea + lipgloss + bubbles. `internal/beads` is the `bd` client, graph
+derivation and the GitHub/pull-request queries, `internal/agent` runs the
+worktree-isolated headless agents, `internal/attention` decides what wants the user,
+and `internal/ui` is the bubbletea model and rendering.
+
+The demo GIF is reproducible: `docs/demo-fixture.sh` seeds a throwaway beads project
+and `vhs docs/demo.tape` re-records `docs/demo.gif` from it.
