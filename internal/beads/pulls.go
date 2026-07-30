@@ -101,10 +101,25 @@ func (c *Client) BoardRepos(graph *Graph, defaultGitHub string) []string {
 	if graph == nil {
 		return nil
 	}
+	// Resolve one repo per distinct repo:: label, not one per bead: a board asks
+	// the same handful of questions 150 times, and each answer costs a git
+	// subprocess on a cache miss.
+	labels := map[string]bool{}
+	for id, is := range graph.Issues {
+		if !Synthetic(id) {
+			labels[repoLabel(is.Labels)] = true
+		}
+	}
 	seen := map[string]bool{}
-	for _, is := range graph.Issues {
-		if repo := c.RepoFor(is.Labels, defaultGitHub).GitHub; repo != "" {
-			seen[repo] = true
+	for label := range labels {
+		var target RepoTarget
+		if label == "" {
+			target = c.RepoFor(nil, defaultGitHub)
+		} else {
+			target = c.RepoFor([]string{repoLabelPrefix + label}, defaultGitHub)
+		}
+		if target.GitHub != "" {
+			seen[target.GitHub] = true
 		}
 	}
 	repos := slices.Collect(maps.Keys(seen))
@@ -190,9 +205,13 @@ func BeadFor(p PullRequest, graph *Graph) string {
 	if graph == nil {
 		return ""
 	}
-	for _, closes := range p.Closes {
+	if len(p.Closes) > 0 {
+		closes := make(map[string]bool, len(p.Closes))
+		for _, url := range p.Closes {
+			closes[url] = true
+		}
 		for id, is := range graph.Issues {
-			if is.ExternalRef != "" && is.ExternalRef == closes {
+			if is.ExternalRef != "" && closes[is.ExternalRef] {
 				return id
 			}
 		}
@@ -211,9 +230,9 @@ func beadFromBranch(branch string, graph *Graph) string {
 	if _, known := graph.Issues[rest]; known {
 		return rest
 	}
-	// Spawned branches carry a uniquifying "-<n>" suffix; the id is the longest
-	// prefix that names a real bead, so an id containing a dash still resolves.
-	for i := strings.LastIndexByte(rest, '-'); i > 0; i = strings.LastIndexByte(rest[:i], '-') {
+	// A spawned branch is the bead id plus exactly one uniquifying "-<n>" segment
+	// (see agent.Spawn), so stripping one segment is the whole decode.
+	if i := strings.LastIndexByte(rest, '-'); i > 0 {
 		if _, known := graph.Issues[rest[:i]]; known {
 			return rest[:i]
 		}

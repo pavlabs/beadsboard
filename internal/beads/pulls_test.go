@@ -120,3 +120,61 @@ func TestBoardReposSkipsUnresolvableSubRepo(t *testing.T) {
 
 	require.Equal(t, []string{"acme/widgets"}, c.BoardRepos(g, "acme/widgets"))
 }
+
+// A remote whose URL carries anything but a plausible owner/repo is refused: the
+// parsed value is interpolated into API paths and into the PR search query.
+func TestParseGitHubRepoRejectsHostileRemotes(t *testing.T) {
+	require.Equal(t, "acme/widgets", parseGitHubRepo("git@github.com:acme/widgets.git"))
+	require.Equal(t, "acme/widgets", parseGitHubRepo("https://github.com/acme/widgets"))
+
+	require.Empty(t, parseGitHubRepo("https://github.com/acme/w is:closed"), "query injection")
+	require.Empty(t, parseGitHubRepo("https://github.com/../.."), "path traversal")
+	require.Empty(t, parseGitHubRepo("https://github.com/acme"), "no repo segment")
+	require.Empty(t, parseGitHubRepo("https://github.com/acme/w/extra"))
+	require.Empty(t, parseGitHubRepo("https://gitlab.com/acme/widgets"))
+}
+
+// A repo:: label picks the subdirectory an agent is worktreed and run in, so it
+// must be a single plain path segment.
+func TestRepoLabelRejectsTraversal(t *testing.T) {
+	require.Equal(t, "proto", repoLabel([]string{"repo::proto"}))
+	require.Empty(t, repoLabel([]string{"repo::../../../elsewhere"}))
+	require.Empty(t, repoLabel([]string{"repo::.."}))
+	require.Empty(t, repoLabel([]string{"repo::a/b"}))
+	require.Empty(t, repoLabel([]string{"repo::"}))
+	require.Empty(t, repoLabel([]string{"gate"}))
+}
+
+// The digest defines what "already pushed" means, so it must move with every
+// mirrored field and stay put for the ones bd stamps on its own writes.
+func TestSyncDigest(t *testing.T) {
+	base := Issue{ID: "a", Title: "T", Status: "open", Priority: 1, Description: "d", Notes: "n", Labels: []string{"x"}}
+	require.Equal(t, SyncDigest(base), SyncDigest(base))
+
+	for name, mutate := range map[string]func(Issue) Issue{
+		"title":       func(i Issue) Issue { i.Title = "other"; return i },
+		"status":      func(i Issue) Issue { i.Status = "closed"; return i },
+		"priority":    func(i Issue) Issue { i.Priority = 2; return i },
+		"description": func(i Issue) Issue { i.Description = "other"; return i },
+		"notes":       func(i Issue) Issue { i.Notes = "other"; return i },
+		"labels":      func(i Issue) Issue { i.Labels = []string{"y"}; return i },
+	} {
+		t.Run(name, func(t *testing.T) {
+			require.NotEqual(t, SyncDigest(base), SyncDigest(mutate(base)))
+		})
+	}
+
+	t.Run("bd's own stamps do not move it", func(t *testing.T) {
+		stamped := base
+		stamped.ExternalRef = "https://github.com/acme/w/issues/1"
+		stamped.UpdatedAt = "2026-07-30T00:00:00Z"
+		require.Equal(t, SyncDigest(base), SyncDigest(stamped),
+			"including these would make every push look like a fresh change")
+	})
+
+	t.Run("field boundaries do not collide", func(t *testing.T) {
+		a := Issue{Title: "ab", Status: "c"}
+		b := Issue{Title: "a", Status: "bc"}
+		require.NotEqual(t, SyncDigest(a), SyncDigest(b))
+	})
+}

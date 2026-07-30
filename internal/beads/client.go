@@ -11,6 +11,7 @@ import (
 	"io"
 	"os/exec"
 	"strings"
+	"sync"
 )
 
 // maxExport caps how much `bd export` output we read into memory, so a
@@ -21,9 +22,18 @@ const maxExport = 64 << 20 // 64 MiB
 // directory because bd keys its embedded state to the repository directory.
 type Client struct {
 	Dir string
+
+	// originRepos memoizes sub-repo remote lookups. Resolving a bead's repo
+	// shells out to `git remote get-url`, and a meta-repo asks the same handful
+	// of questions once per bead — 150 beads over 15 sub-repos is 150
+	// subprocesses to learn 15 facts. Remotes don't move during a session.
+	mu          sync.Mutex
+	originRepos map[string]string
 }
 
-func NewClient(dir string) *Client { return &Client{Dir: dir} }
+func NewClient(dir string) *Client {
+	return &Client{Dir: dir, originRepos: map[string]string{}}
+}
 
 // Load returns every issue, fully hydrated, via a single `bd export --all`,
 // plus a revision hash of the exported data. The hash is what the board watches
@@ -193,6 +203,11 @@ func (c *Client) Comment(ctx context.Context, id, body string) error {
 	}
 	return nil
 }
+
+// Sanitize is sanitize, exported so other layers can apply it at their own
+// boundary — an agent's question or result can quote content it read from a diff
+// or an issue body, and that text reaches the terminal too.
+func Sanitize(s string) string { return sanitize(s) }
 
 // sanitize strips control bytes that could smuggle terminal escape sequences
 // (ANSI/OSC — e.g. clipboard writes or title rewrites) out of untrusted issue
