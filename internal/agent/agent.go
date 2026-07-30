@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/pavlabs/beadsboard/internal/agentreg"
+	"github.com/pavlabs/beadsboard/internal/beads"
 )
 
 // NeedsInputMarker is the sentinel the spawn prompt asks the agent to emit when
@@ -97,7 +98,11 @@ func (a *agent) snapshot() View {
 	return v
 }
 
+// push records a line of the agent's output. The text is sanitized here because
+// an agent quotes what it reads — a diff, an issue body, a fetched file — and all
+// of it lands in the TUI, where a stray escape sequence would drive the terminal.
 func (a *agent) push(s string) {
+	s = beads.Sanitize(s)
 	a.tail = append(a.tail, s)
 	if len(a.tail) > 200 {
 		a.tail = a.tail[len(a.tail)-200:]
@@ -349,7 +354,7 @@ func (m *Manager) ingest(a *agent, line []byte) {
 	}
 	if ev.Result != "" {
 		a.pendingResult = ev.Result
-		a.Summary = firstLine(ev.Result)
+		a.Summary = beads.Sanitize(firstLine(ev.Result))
 	}
 	m.mu.Unlock()
 	// Persist the session id once, so a rediscovered agent stays resumable.
@@ -368,11 +373,11 @@ func (m *Manager) finalize(a *agent, waitErr error, logPath string) {
 		a.Status = Killed
 	case strings.Contains(a.pendingResult, NeedsInputMarker):
 		a.Status = NeedsInput
-		a.Question = extractQuestion(a.pendingResult)
+		a.Question = beads.Sanitize(extractQuestion(a.pendingResult))
 	case waitErr != nil:
 		a.Status = Failed
 		if a.Summary == "" {
-			a.Summary = firstLine(waitErr.Error())
+			a.Summary = beads.Sanitize(firstLine(waitErr.Error()))
 		}
 	default:
 		a.Status = Done

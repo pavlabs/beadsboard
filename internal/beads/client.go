@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"os/exec"
 	"strings"
+	"sync"
 )
 
 // maxExport caps how much `bd export` output we read into memory, so a
@@ -20,15 +22,28 @@ const maxExport = 64 << 20 // 64 MiB
 // directory because bd keys its embedded state to the repository directory.
 type Client struct {
 	Dir string
+
+	// originRepos memoizes sub-repo remote lookups. Resolving a bead's repo
+	// shells out to `git remote get-url`, and a meta-repo asks the same handful
+	// of questions once per bead — 150 beads over 15 sub-repos is 150
+	// subprocesses to learn 15 facts. Remotes don't move during a session.
+	mu          sync.Mutex
+	originRepos map[string]string
 }
 
-func NewClient(dir string) *Client { return &Client{Dir: dir} }
+func NewClient(dir string) *Client {
+	return &Client{Dir: dir, originRepos: map[string]string{}}
+}
 
-// Load returns every issue, fully hydrated, via a single `bd export --all`.
+// Load returns every issue, fully hydrated, via a single `bd export --all`,
+// plus a revision hash of the exported data. The hash is what the board watches
+// for change: `bd` rewrites Dolt's journal and .beads/last-touched on reads as
+// well as writes, so file state cannot tell our own polling apart from someone
+// else's edit, whereas the data only moves when the issues actually do.
 // Each `bd` invocation cold-starts an embedded Dolt engine (~0.3s) and
 // concurrent invocations contend, so one bulk export beats per-issue fetches.
 // Untrusted text fields are sanitized here so no downstream consumer has to.
-func (c *Client) Load(ctx context.Context) (map[string]Issue, error) {
+func (c *Client) Load(ctx context.Context) (map[string]Issue, uint64, error) {
 	cmd := exec.CommandContext(ctx, "bd", "export", "--all")
 	cmd.Dir = c.Dir
 	var stderr bytes.Buffer
@@ -36,15 +51,36 @@ func (c *Client) Load(ctx context.Context) (map[string]Issue, error) {
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, fmt.Errorf("bd export: %w", err)
+		return nil, 0, fmt.Errorf("bd export: %w", err)
 	}
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("bd export: %w", err)
+		return nil, 0, fmt.Errorf("bd export: %w", err)
 	}
 
+	byID, rev, decodeErr := decodeExport(stdout)
+	// Drain any remainder so the child never blocks on a full pipe, then reap it.
+	_, _ = io.Copy(io.Discard, stdout)
+	waitErr := cmd.Wait()
+
+	switch {
+	case waitErr != nil:
+		if s := sanitize(strings.TrimSpace(stderr.String())); s != "" {
+			return nil, 0, fmt.Errorf("bd export: %w: %s", waitErr, s)
+		}
+		return nil, 0, fmt.Errorf("bd export: %w", waitErr)
+	case decodeErr != nil:
+		return nil, 0, decodeErr
+	}
+	return byID, rev, nil
+}
+
+// decodeExport parses export's line-delimited issues and folds the raw lines
+// into a revision hash. The hash covers the bytes as bd emitted them, before
+// sanitizing, so it tracks the source data rather than our rendering of it.
+func decodeExport(r io.Reader) (map[string]Issue, uint64, error) {
 	byID := map[string]Issue{}
-	var decodeErr error
-	sc := bufio.NewScanner(io.LimitReader(stdout, maxExport))
+	h := fnv.New64a()
+	sc := bufio.NewScanner(io.LimitReader(r, maxExport))
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for sc.Scan() {
 		line := bytes.TrimSpace(sc.Bytes())
@@ -53,9 +89,9 @@ func (c *Client) Load(ctx context.Context) (map[string]Issue, error) {
 		}
 		var is Issue
 		if err := json.Unmarshal(line, &is); err != nil {
-			decodeErr = fmt.Errorf("decode export line: %w", err)
-			break
+			return nil, 0, fmt.Errorf("decode export line: %w", err)
 		}
+		h.Write(line)
 		is.Title = sanitize(is.Title)
 		is.Description = sanitize(is.Description)
 		is.Notes = sanitize(is.Notes)
@@ -64,23 +100,10 @@ func (c *Client) Load(ctx context.Context) (map[string]Issue, error) {
 		}
 		byID[is.ID] = is
 	}
-	scanErr := sc.Err()
-	// Drain any remainder so the child never blocks on a full pipe, then reap it.
-	_, _ = io.Copy(io.Discard, stdout)
-	waitErr := cmd.Wait()
-
-	switch {
-	case waitErr != nil:
-		if s := sanitize(strings.TrimSpace(stderr.String())); s != "" {
-			return nil, fmt.Errorf("bd export: %w: %s", waitErr, s)
-		}
-		return nil, fmt.Errorf("bd export: %w", waitErr)
-	case decodeErr != nil:
-		return nil, decodeErr
-	case scanErr != nil:
-		return nil, fmt.Errorf("read export: %w", scanErr)
+	if err := sc.Err(); err != nil {
+		return nil, 0, fmt.Errorf("read export: %w", err)
 	}
-	return byID, nil
+	return byID, h.Sum64(), nil
 }
 
 // Ready returns the issues that are ready to work — open with no active
@@ -180,6 +203,11 @@ func (c *Client) Comment(ctx context.Context, id, body string) error {
 	}
 	return nil
 }
+
+// Sanitize is sanitize, exported so other layers can apply it at their own
+// boundary — an agent's question or result can quote content it read from a diff
+// or an issue body, and that text reaches the terminal too.
+func Sanitize(s string) string { return sanitize(s) }
 
 // sanitize strips control bytes that could smuggle terminal escape sequences
 // (ANSI/OSC — e.g. clipboard writes or title rewrites) out of untrusted issue

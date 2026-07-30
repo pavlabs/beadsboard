@@ -21,7 +21,14 @@ import (
 	"github.com/pavlabs/beadsboard/internal/config"
 )
 
-const refreshInterval = time.Second
+// refreshInterval paces the watcher. Each poll is a full `bd export` (~0.4s on a
+// 126-bead project), so this is deliberately slower than a filesystem stat loop.
+const refreshInterval = 2 * time.Second
+
+// pullsInterval paces the pull-request fetch. It costs a GitHub API call, which
+// is rate limited and far slower to change than local bead state, so it runs on
+// its own clock rather than with every board refresh.
+const pullsInterval = time.Minute
 
 type model struct {
 	client *beads.Client
@@ -73,14 +80,33 @@ type model struct {
 	settingsOpen bool
 	setField     int // which setting the cursor is on
 
+	inboxOpen   bool // the board-wide attention inbox is capturing keys
+	inboxCursor int  // selected attention item
+
+	pulls   []beads.PullRequest // open PRs across the owner's repos, last fetch
+	pullsAt time.Time           // when that fetch landed; zero means never
+
 	pickerOpen    bool   // the launcher matrix is capturing keys
 	pickerTarget  string // bead the launch acts on
 	pickerScope   string // "task" | "epic"
 	pickerMode    int    // pickCoding | pickPlanning
 	pickerBackend int    // pickClaude | pickCodex
 
-	fp    uint64
-	hasFP bool
+	// rev is the revision hash of the issue data behind the current graph; 0
+	// means no load has landed yet (an fnv sum is never 0).
+	rev uint64
+
+	// loadGen sequences loads. A poll's export can finish after a later edit's
+	// reload has already landed — it would then install pre-edit data and push the
+	// bead again — so a poll carries the generation it was issued in and is
+	// discarded if anything has been adopted since.
+	loadGen uint64
+
+	// pushed records each bead's synced-field digest as of the last successful
+	// push, so a bead is never pushed twice for the same content. Without it, any
+	// field bd writes back during a push would read as a fresh change and push
+	// again, and a bead bd fails to link would be re-created on every load.
+	pushed map[string]uint64
 
 	subLinked map[string]bool // task issue URLs already linked as GitHub sub-issues
 
@@ -140,13 +166,21 @@ var editStatuses = []string{"open", "in_progress", "blocked", "closed"}
 type (
 	hydratedMsg struct {
 		graph *beads.Graph
-		fp    uint64 // fingerprint measured just after load, used as the new baseline
+		rev   uint64 // revision of the loaded data, adopted as the new baseline
 		err   error
 	}
 	tickMsg struct{}
-	fpMsg   struct {
-		fp  uint64
-		err error
+	// polledMsg carries a watcher poll: the same load hydrate does, but adopted
+	// only when its revision differs from the one on screen.
+	polledMsg struct {
+		graph *beads.Graph
+		rev   uint64
+		gen   uint64 // load generation this poll was issued in
+		err   error
+	}
+	pullsLoadedMsg struct {
+		pulls []beads.PullRequest
+		err   error
 	}
 	editSavedMsg  struct{ err error }
 	deletedMsg    struct{ err error }
@@ -154,7 +188,7 @@ type (
 	spawnedMsg    struct{ err error }
 	interveneMsg  struct{ err error }
 	pushedMsg     struct {
-		fp  uint64 // fingerprint after the push, to re-baseline and not self-trigger
+		ids []string // beads that reached GitHub, whose digests are now current
 		err error
 	}
 	pulledMsg struct {
@@ -222,8 +256,8 @@ func New(dir string) model {
 }
 
 func (m model) Init() tea.Cmd {
-	// The post-load fingerprint from hydrateCmd seeds the watcher baseline, so no
-	// independent fpCmd here; the hydrate handler kicks off the GitHub push.
+	// The revision from hydrateCmd seeds the watcher baseline, so there is no
+	// independent probe here; the hydrate handler kicks off the GitHub push.
 	return tea.Batch(m.spinner.Tick, m.hydrateCmd(), tickCmd(), m.waitAgentEvent(), m.regCmd(), m.commentsCmd())
 }
 
@@ -238,28 +272,63 @@ func (m model) waitAgentEvent() tea.Cmd {
 }
 
 func (m model) hydrateCmd() tea.Cmd {
-	dir := m.client.Dir
+	client := m.client
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		issues, err := m.client.Load(ctx)
+		graph, rev, err := load(client)
 		if err != nil {
 			return hydratedMsg{err: err}
 		}
-		// `bd export` itself churns Dolt's journal, so snapshot the fingerprint
-		// after loading; that becomes the baseline the watcher compares against,
-		// leaving only external writes to trigger the next reload.
-		fp, _ := beads.Fingerprint(dir)
-		return hydratedMsg{graph: beads.BuildGraph(issues), fp: fp}
+		return hydratedMsg{graph: graph, rev: rev}
 	}
 }
 
-func (m model) fpCmd() tea.Cmd {
-	dir := m.client.Dir
+// pollCmd is the watcher: the same load, whose revision the handler compares
+// against the one on screen. Polling by loading rather than by stat'ing .beads
+// is what keeps our own `bd` reads from reading as somebody else's write.
+func (m model) pollCmd() tea.Cmd {
+	client, gen := m.client, m.loadGen
 	return func() tea.Msg {
-		fp, err := beads.Fingerprint(dir)
-		return fpMsg{fp: fp, err: err}
+		graph, rev, err := load(client)
+		return polledMsg{graph: graph, rev: rev, gen: gen, err: err}
 	}
+}
+
+// pullsCmd fetches the open PRs in the repos this board's beads live in. It is
+// due only when the board syncs with GitHub, at least one repo resolves, and the
+// last fetch has aged out.
+func (m model) pullsCmd() tea.Cmd {
+	if !m.cfg.GitHubSync {
+		return nil
+	}
+	if !m.pullsAt.IsZero() && time.Since(m.pullsAt) < pullsInterval {
+		return nil
+	}
+	if m.graph == nil {
+		return nil // nothing to resolve repos from yet
+	}
+	client, graph, defaultRepo := m.client, m.graph, m.cfg.GitHubRepository
+	return func() tea.Msg {
+		// Resolving the board's repos can shell out to git, so it belongs in here
+		// rather than on the update goroutine that renders the next frame.
+		repos := client.BoardRepos(graph, defaultRepo)
+		if len(repos) == 0 {
+			return pullsLoadedMsg{}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		pulls, err := client.PullRequests(ctx, repos)
+		return pullsLoadedMsg{pulls: pulls, err: err}
+	}
+}
+
+func load(client *beads.Client) (*beads.Graph, uint64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	issues, rev, err := client.Load(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	return beads.BuildGraph(issues), rev, nil
 }
 
 func tickCmd() tea.Cmd {
@@ -289,34 +358,109 @@ func (m model) commentsCmd() tea.Cmd {
 // startReload flips to the loading state and kicks off a fresh hydrate.
 func (m model) startReload() (tea.Model, tea.Cmd) {
 	m.loading = true
+	m.loadGen++
 	return m, tea.Batch(m.spinner.Tick, m.hydrateCmd())
 }
 
-// pushGroupsCmd pushes every bead to its GitHub repo after a load, grouped by
-// the repo its repo:: label resolves to (all beads share the default repo in a
-// single-repo project). Runs after hydrate so it can group from the fresh graph;
-// the caller holds the loading flag until pushedMsg so the watcher can't fire a
-// concurrent push. It re-baselines the fingerprint to the post-push state so its
-// own writes don't trigger another reload.
-func (m model) pushGroupsCmd() tea.Cmd {
-	client, cfg, dir := m.client, m.cfg, m.client.Dir
-	groups := map[string][]string{}
-	for id, is := range m.graph.Issues {
-		if repo := client.RepoFor(is.Labels, cfg.GitHubRepository).GitHub; repo != "" {
-			groups[repo] = append(groups[repo], id)
+// adopt installs a freshly loaded graph and its revision as the new baseline.
+// Both an explicit hydrate and a watcher poll land here, so the two paths cannot
+// drift on what adopting a load entails.
+func (m model) adopt(graph *beads.Graph, rev uint64) (tea.Model, tea.Cmd) {
+	// Diff against what was on screen before adopting, so only the beads that
+	// actually moved get pushed.
+	changed := beads.ChangedForSync(m.graph, graph)
+
+	m.err = nil
+	m.graph = graph
+	m.rev = rev
+	m.loadGen++
+	m.clampCursors()
+	m.syncDetail()
+	if m.cfg.GitHubSync {
+		// Hold loading so the watcher can't fire a concurrent push mid-sync;
+		// pushedMsg clears it. A load that changed nothing pushes nothing.
+		if cmd := m.pushGroupsCmd(m.unpushed(changed)); cmd != nil {
+			m.loading = true
+			// Re-arm the spinner: it stops whenever loading goes false, so a push
+			// triggered by a poll rather than a keypress would show a frozen glyph.
+			return m, tea.Batch(m.spinner.Tick, cmd)
 		}
 	}
+	m.loading = false
+	return m, nil
+}
+
+// pushGroupsCmd pushes the given beads to their GitHub repos, grouped by the
+// repo each one's repo:: label resolves to (all beads share the default repo in a
+// single-repo project). The caller holds the loading flag until pushedMsg so the
+// watcher can't fire a concurrent push. Pushing stamps external refs back onto
+// the beads, which the next poll adopts along with the graph that describes
+// them — a push moves no field ChangedForSync compares, so adopting its own
+// writes cannot trigger another push. Nothing to push means no command at all.
+func (m model) pushGroupsCmd(ids []string) tea.Cmd {
+	if len(ids) == 0 {
+		return nil
+	}
+	client, graph, defaultRepo := m.client, m.graph, m.cfg.GitHubRepository
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-		defer cancel()
-		for repo, ids := range groups {
-			if err := client.SyncIssues(ctx, ids, repo); err != nil {
-				return pushedMsg{err: err}
+		// Grouping resolves each bead's repo, which can shell out to git, so it
+		// belongs in here rather than on the goroutine that renders the next frame.
+		groups := map[string][]string{}
+		for _, id := range ids {
+			is, ok := graph.Issues[id]
+			if !ok {
+				// ids come from ChangedForSync over this same graph, so this holds
+				// by construction; it stays because an id that slipped through
+				// would carry no labels and so resolve to the default repo.
+				continue
+			}
+			if repo := client.RepoFor(is.Labels, defaultRepo).GitHub; repo != "" {
+				groups[repo] = append(groups[repo], id)
 			}
 		}
-		fp, _ := beads.Fingerprint(dir)
-		return pushedMsg{fp: fp}
+
+		var pushed []string
+		for repo, group := range groups {
+			// A deadline per repo, sized to its batch: one slow or oversized repo
+			// must not eat the budget the others still need.
+			ctx, cancel := context.WithTimeout(context.Background(), syncTimeout(len(group)))
+			err := client.SyncIssues(ctx, group, repo)
+			cancel()
+			if err != nil {
+				// Report what did land, so a later repo failing doesn't make the
+				// earlier ones look unpushed and push them all again.
+				return pushedMsg{ids: pushed, err: err}
+			}
+			pushed = append(pushed, group...)
+		}
+		return pushedMsg{ids: pushed}
 	}
+}
+
+// unpushed drops beads whose content is already what we last pushed. It is the
+// backstop for the two ways a diff alone can push in a loop: a field bd writes
+// back during its own push, and a bead bd creates an issue for but fails to link
+// (which leaves it looking unsynced forever).
+func (m model) unpushed(ids []string) []string {
+	var out []string
+	for _, id := range ids {
+		is, ok := m.graph.Issues[id]
+		if !ok {
+			continue
+		}
+		if last, seen := m.pushed[id]; seen && last == beads.SyncDigest(is) {
+			continue
+		}
+		out = append(out, id)
+	}
+	return out
+}
+
+// syncTimeout budgets one repo's push: a fixed allowance for bd's Dolt cold
+// start plus room per bead, so a routine one-bead edit isn't held to the same
+// ceiling as a first-time sync of a whole epic.
+func syncTimeout(beads int) time.Duration {
+	return 15*time.Second + time.Duration(beads)*3*time.Second
 }
 
 // linkSubIssuesCmd mirrors the bd epic→task hierarchy on GitHub as native
@@ -415,23 +559,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = msg.err
 			return m, nil
 		}
-		m.err = nil
-		m.graph = msg.graph
-		m.fp, m.hasFP = msg.fp, true // baseline absorbs our own export's churn
-		m.clampCursors()
-		m.syncDetail()
-		if m.cfg.GitHubSync {
-			// Push changed beads to their repos; hold loading so the watcher can't
-			// fire a concurrent push mid-sync. pushedMsg clears loading.
-			return m, m.pushGroupsCmd()
-		}
-		m.loading = false
-		return m, nil
+		return m.adopt(msg.graph, msg.rev)
 
 	case tickMsg:
 		m.reloadConfigIfChanged()
 		m.mgr.PruneRecent(time.Duration(m.cfg.RecentTTLSecs) * time.Second)
-		return m, tea.Batch(m.fpCmd(), tickCmd(), m.regCmd(), m.commentsCmd())
+		cmds := []tea.Cmd{tickCmd(), m.regCmd(), m.commentsCmd(), m.pullsCmd()}
+		if !m.loading {
+			// A poll shells out to bd; skip it while a load or push already holds
+			// the board, rather than contending with it for the Dolt engine.
+			cmds = append(cmds, m.pollCmd())
+		}
+		return m, tea.Batch(cmds...)
 
 	case agentEventMsg:
 		m.clampAgentCursor()
@@ -451,16 +590,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case fpMsg:
-		// Reload only when an external bd write moved the state away from the
-		// baseline captured after our last load.
-		if msg.err != nil || !m.hasFP || m.loading {
+	case polledMsg:
+		// Adopt only when the issue data moved away from what's on screen. The
+		// poll already carries the fresh graph, so an adopted change needs no
+		// second load and never flashes the loading state.
+		if m.loading || msg.gen != m.loadGen {
+			return m, nil // superseded by a load that landed while this one ran
+		}
+		if msg.err != nil {
+			// Surface it: the poll *is* the load now, so a persistent bd failure
+			// would otherwise leave the board silently frozen on stale data while
+			// the header claims it is synced. adopt clears this on recovery.
+			m.err = msg.err
 			return m, nil
 		}
-		if msg.fp != m.fp {
-			return m.startReload() // external write: reload, then hydrate pushes it up
+		if msg.rev == m.rev {
+			return m, nil
 		}
-		return m, nil
+		return m.adopt(msg.graph, msg.rev)
 
 	case editSavedMsg:
 		if msg.err != nil {
@@ -479,15 +626,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.startReload() // drop the deleted bead and reclamp cursors
 
 	case pushedMsg:
-		m.loading = false // held since hydratedMsg while the push ran
+		m.loading = false // held since the adopt that started the push
+		if m.pushed == nil {
+			m.pushed = map[string]uint64{}
+		}
+		for _, id := range msg.ids {
+			if is, ok := m.graph.Issues[id]; ok {
+				m.pushed[id] = beads.SyncDigest(is)
+			}
+		}
 		if msg.err != nil {
 			m.notice = msg.err.Error()
 			return m, nil
 		}
-		if msg.fp != 0 {
-			m.fp = msg.fp // absorb the push's own writes so it doesn't self-trigger
-		}
 		return m, m.linkSubIssuesCmd() // mirror the epic→task hierarchy as sub-issues
+
+	case pullsLoadedMsg:
+		// Stamp the fetch either way: a GitHub outage must not turn into a retry
+		// loop against a rate-limited API.
+		m.pullsAt = time.Now()
+		if msg.err != nil {
+			m.notice = msg.err.Error()
+			return m, nil
+		}
+		if msg.pulls != nil {
+			m.pulls = msg.pulls // an empty fetch must not wipe the last good one
+		}
+		return m, nil
 
 	case regLoadedMsg:
 		m.agentRecords, m.agentAlive = msg.records, msg.alive
@@ -547,6 +712,9 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.pendingDelete != "" {
 		return m.handleConfirmDelete(msg)
 	}
+	if m.inboxOpen {
+		return m.handleInboxKey(msg)
+	}
 	m.notice = "" // any key dismisses a transient notice
 	switch msg.String() {
 	case "q", "ctrl+c":
@@ -556,6 +724,9 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.startReload()
 		}
 		return m, nil
+	case "i":
+		// Board-wide, so it opens from anywhere rather than per-pane.
+		return m.openInbox()
 	}
 	if m.tab == tabAgents {
 		return m.handleAgentsKey(msg)

@@ -5,11 +5,71 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 )
+
+// ChangedForSync lists the beads whose GitHub-visible state moved between two
+// loads, plus any that have no issue yet. It is what the board pushes, rather
+// than the whole board: one edit should cost one issue update, and a reload that
+// changed nothing should cost no API calls at all.
+//
+// With no previous graph — the first load of a session — only never-synced beads
+// are returned. Beads that already have an issue are taken to be in step from
+// the last session; pushing all of them on every startup to prove it is what
+// made a single title edit take minutes.
+func ChangedForSync(prev, next *Graph) []string {
+	if next == nil {
+		return nil
+	}
+	var ids []string
+	for id, is := range next.Issues {
+		if Synthetic(id) {
+			continue // a display device, with no issue behind it to create
+		}
+		if is.ExternalRef == "" {
+			ids = append(ids, id) // no issue yet: it has to be created
+			continue
+		}
+		if prev == nil {
+			continue
+		}
+		before, existed := prev.Issues[id]
+		if !existed || syncedFieldsDiffer(before, is) {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+// SyncDigest folds the fields bd mirrors onto the GitHub issue into one value,
+// so a caller can also ask "does this bead still match what I last pushed?"
+// without keeping a copy of it. Dependencies are excluded: they drive sub-issue
+// linking, not the issue itself. External refs and timestamps are excluded
+// deliberately — bd stamps those on its own writes, so including them would make
+// every push look like a fresh change and push again.
+func SyncDigest(is Issue) uint64 {
+	h := fnv.New64a()
+	// A separator between fields, so "ab"+"c" cannot collide with "a"+"bc".
+	write := func(s string) { h.Write([]byte(s)); h.Write([]byte{0}) }
+	write(is.Title)
+	write(is.Status)
+	write(strconv.Itoa(is.Priority))
+	write(is.Description)
+	write(is.Notes)
+	for _, l := range is.Labels {
+		write(l)
+	}
+	return h.Sum64()
+}
+
+// syncedFieldsDiffer reports whether anything mirrored onto the issue moved.
+func syncedFieldsDiffer(a, b Issue) bool { return SyncDigest(a) != SyncDigest(b) }
 
 // statusLabelPrefix is bd's carrier for a bead's rich status on the issue
 // (status::in_progress, status::blocked, …) — the key::value house style bd's
@@ -152,8 +212,11 @@ func githubEnv(repo string) []string {
 // SyncIssues pushes the given beads to GitHub via
 // `bd github sync --push-only --issues <ids>`, targeting repo. Push-only and
 // issue-scoped so a sync never pulls unrelated remote changes back, and scoped
-// to one repo so a meta-repo can push each group to its own repo. bd only sends
-// what differs from the last sync, so an unchanged group is a no-op.
+// to one repo so a meta-repo can push each group to its own repo.
+//
+// bd does NOT diff before writing: `--dry-run` reports "would update" for every
+// bead handed to it, changed or not. So the caller decides what needs pushing —
+// see ChangedForSync — because every id in this list costs a GitHub write.
 func (c *Client) SyncIssues(ctx context.Context, ids []string, repo string) error {
 	if len(ids) == 0 {
 		return nil

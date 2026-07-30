@@ -15,10 +15,13 @@ var (
 	grey   = lipgloss.Color("244")
 	dim    = lipgloss.Color("240")
 	mag    = lipgloss.Color("170")
+	red    = lipgloss.Color("203")
 
 	titleStyle    = lipgloss.NewStyle().Bold(true)
 	dimStyle      = lipgloss.NewStyle().Foreground(dim)
 	labelStyle    = lipgloss.NewStyle().Foreground(grey)
+	warnStyle     = lipgloss.NewStyle().Foreground(yellow)
+	okStyle       = lipgloss.NewStyle().Foreground(green)
 	selectedStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("231")).Background(lipgloss.Color("236"))
 
 	headerStyle = lipgloss.NewStyle().Bold(true).Foreground(mag)
