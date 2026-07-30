@@ -19,6 +19,13 @@ const (
 // keeps it clear of real bd ids and sorts it last.
 const orphanEpicID = "~orphans"
 
+// Synthetic reports whether an id names a display device rather than a real bead.
+// The orphan bucket lives in Issues so the epic list and its renderers can treat
+// it like any other epic, which means every caller that iterates Issues expecting
+// real beads — especially anything that writes to bd or GitHub — has to ask this
+// rather than rediscover the exception.
+func Synthetic(id string) bool { return id == orphanEpicID }
+
 // Graph is the derived, display-ready view over a set of hydrated issues.
 type Graph struct {
 	Issues map[string]Issue

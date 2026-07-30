@@ -144,22 +144,33 @@ func TestInboxShowsUncorrelatedPullRequest(t *testing.T) {
 }
 
 // The PR fetch is rate-limit sensitive, so it stays quiet unless GitHub sync is
-// on with repos to search, and it does not re-fire inside its interval.
+// on, and it does not re-fire inside its interval.
 func TestPullsFetchGating(t *testing.T) {
 	m := testModel()
 	require.Nil(t, m.pullsCmd(), "no fetch without github sync")
 
 	m.cfg.GitHubSync = true
-	require.Nil(t, m.pullsCmd(), "no fetch when no repo resolves")
-
 	m.cfg.GitHubRepository = "acme/widgets"
-	require.NotNil(t, m.pullsCmd(), "fetch when a repo resolves and never fetched")
+	require.NotNil(t, m.pullsCmd(), "fetch when configured and never fetched")
 
 	m.pullsAt = time.Now()
 	require.Nil(t, m.pullsCmd(), "no refetch inside the interval")
 
 	m.pullsAt = time.Now().Add(-2 * pullsInterval)
 	require.NotNil(t, m.pullsCmd(), "refetch once the interval elapses")
+}
+
+// Resolving the board's repos can shell out to git, so it happens inside the
+// command rather than on the update goroutine that renders the next frame. A
+// board with no resolvable repo therefore reports an empty result rather than
+// skipping the command — and must not reach GitHub to discover that.
+func TestPullsFetchWithoutResolvableRepoIsEmpty(t *testing.T) {
+	m := testModel()
+	m.cfg.GitHubSync = true // no GitHubRepository set, and no repo:: labels
+
+	cmd := m.pullsCmd()
+	require.NotNil(t, cmd)
+	require.Equal(t, pullsLoadedMsg{}, cmd())
 }
 
 // A GitHub failure stamps the clock anyway, so an outage cannot become a retry
@@ -171,4 +182,41 @@ func TestPullsErrorStampsClock(t *testing.T) {
 
 	require.False(t, m.pullsAt.IsZero())
 	require.Contains(t, m.notice, "rate limited")
+}
+
+// A settled board states it outright, so the absence of a spinner is never left
+// to be read as "maybe still working". The wording tracks what settling actually
+// guaranteed: with sync on, the GitHub push finished too.
+func TestHeaderShowsSyncedState(t *testing.T) {
+	m := testModel()
+	require.Contains(t, m.View(), "✓ synced")
+	require.NotContains(t, m.View(), "synced with github")
+
+	m.cfg.GitHubSync = true
+	require.Contains(t, m.View(), "✓ synced with github")
+
+	m.loading = true
+	require.Contains(t, m.View(), "refreshing")
+	require.NotContains(t, m.View(), "✓ synced")
+
+	m.loading = false
+	m.err = errors.New("bd export: boom")
+	out := m.View()
+	require.Contains(t, out, "boom")
+	require.NotContains(t, out, "✓ synced", "an errored load is not a synced board")
+}
+
+// The jump has to resolve against the visible list, since that is what the
+// cursors index — with a search filter active, a graph-order index selects the
+// wrong epic.
+func TestInboxJumpRespectsSearchFilter(t *testing.T) {
+	m := blockedModel()
+	m.searchScope = scopeEpics
+	m.search.SetValue("beta") // filters the epic list down to "Beta epic" (id b)
+
+	next, _ := m.jumpToBead("b.1")
+	m = next.(model)
+
+	require.Equal(t, "b", m.currentEpic())
+	require.Equal(t, "b.1", m.currentTask())
 }

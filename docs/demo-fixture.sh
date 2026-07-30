@@ -4,6 +4,12 @@
 set -euo pipefail
 
 DIR=${1:-/tmp/payments-platform}
+# This rm is why: refuse anything that isn't a throwaway path, so a stray
+# argument cannot delete a real directory.
+case "$DIR" in
+  /tmp/*|/private/tmp/*|"${TMPDIR:-/tmp}"/*) ;;
+  *) echo "refusing to seed outside a temp directory: $DIR" >&2; exit 1 ;;
+esac
 rm -rf "$DIR"
 mkdir -p "$DIR"
 cd "$DIR"

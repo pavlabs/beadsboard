@@ -1,6 +1,7 @@
 package beads
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -103,4 +104,16 @@ func TestChangedForSyncSkipsOrphanBucket(t *testing.T) {
 
 	require.NotContains(t, ChangedForSync(nil, next), orphanEpicID)
 	require.NotContains(t, ChangedForSync(next, next), orphanEpicID)
+}
+
+// syncedFieldsDiffer hand-lists the fields bd mirrors onto the issue, because
+// nothing local can derive that list — UpdatedAt and a whole-record hash both
+// re-introduce a push loop, since bd stamps external_ref/updated_at on its own
+// writes. The hand-list's failure mode is silent: add a mirrored field to Issue
+// and edits to it stop reaching GitHub forever, with no test failing. This turns
+// that into a loud one.
+func TestSyncedFieldsCoverIssueShape(t *testing.T) {
+	const reviewed = 11 // fields on Issue when the projection was last reviewed
+	require.Equal(t, reviewed, reflect.TypeFor[Issue]().NumField(),
+		"beads.Issue changed shape — check whether the new field is mirrored onto the GitHub issue and belongs in syncedFieldsDiffer, then update this count")
 }

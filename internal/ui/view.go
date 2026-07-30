@@ -77,19 +77,31 @@ func (m model) View() string {
 func (m model) headerLine() string {
 	title := headerStyle.Render("beadsboard")
 	sub := dimStyle.Render("  " + m.client.Dir)
-	if m.loading && m.graph != nil {
+	// A settled board says so outright, rather than leaving the absence of a
+	// spinner to be read as "maybe still working". The wording tracks what
+	// settling actually guaranteed: with sync on, the GitHub push finished too.
+	switch {
+	case m.graph == nil:
+	case m.loading:
 		sub += "  " + m.spinner.View() + dimStyle.Render(" refreshing")
-	} else if m.err != nil && m.graph != nil {
-		sub += lipgloss.NewStyle().Foreground(yellow).Render("  ⚠ " + m.err.Error())
+	case m.err != nil:
+		sub += warnStyle.Render("  ⚠ " + m.err.Error())
+	case m.cfg.GitHubSync:
+		sub += okStyle.Render("  ✓ synced with github")
+	default:
+		sub += okStyle.Render("  ✓ synced")
 	}
 	if m.notice != "" {
-		sub += lipgloss.NewStyle().Foreground(yellow).Render("  ⚠ " + m.notice)
+		sub += warnStyle.Render("  ⚠ " + m.notice)
 	}
 	// The badge is the only board-wide signal that something off-screen wants the
-	// user, so it rides the header rather than any one pane.
-	if n := m.attentionCount(); n > 0 && !m.inboxOpen {
-		sub += lipgloss.NewStyle().Foreground(yellow).Render(fmt.Sprintf("  ● %d need attention", n))
-		sub += dimStyle.Render(" (i)")
+	// user, so it rides the header rather than any one pane. Guard before counting:
+	// the count walks every source, and with the inbox open it is thrown away.
+	if !m.inboxOpen {
+		if n := m.attentionCount(); n > 0 {
+			sub += warnStyle.Render(fmt.Sprintf("  ● %d need attention", n))
+			sub += dimStyle.Render(" (i)")
+		}
 	}
 	return title + sub
 }

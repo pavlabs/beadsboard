@@ -88,7 +88,13 @@ const staleAfter = 7 * 24 * time.Hour
 // severity. Managed agents win over registry records for the same agent: the
 // manager knows why an agent stopped, the registry only knows whether its
 // process is alive.
-func Collect(views []agent.View, records []agentreg.Record, pulls []beads.PullRequest, graph *beads.Graph, now time.Time) []Item {
+//
+// alive maps a registry record's ID to whether its process still exists. It is
+// passed in rather than probed here because the caller already computes it off
+// the render path; asking the kernel again per record per frame would both put
+// syscalls on the hot path and create a second answer that can disagree with the
+// liveness the rest of the UI shows.
+func Collect(views []agent.View, records []agentreg.Record, alive map[string]bool, pulls []beads.PullRequest, graph *beads.Graph, now time.Time) []Item {
 	var items []Item
 	managed := map[string]bool{}
 	for _, v := range views {
@@ -101,7 +107,7 @@ func Collect(views []agent.View, records []agentreg.Record, pulls []beads.PullRe
 		if managed[rec.ID] {
 			continue
 		}
-		if it, ok := fromRecord(rec, graph); ok {
+		if it, ok := fromRecord(rec, alive[rec.ID], graph); ok {
 			items = append(items, it)
 		}
 	}
@@ -139,8 +145,8 @@ func fromView(v agent.View) (Item, bool) {
 // fromRecord catches agents nobody is supervising: the process is gone but the
 // record was never cleaned up, so its bead is stranded mid-flight. A bead that
 // already reached closed needs no attention — the agent simply finished.
-func fromRecord(rec agentreg.Record, graph *beads.Graph) (Item, bool) {
-	if rec.Alive() || beadStatus(graph, rec.BeadID) == "closed" {
+func fromRecord(rec agentreg.Record, alive bool, graph *beads.Graph) (Item, bool) {
+	if alive || beadStatus(graph, rec.BeadID) == "closed" {
 		return Item{}, false
 	}
 	return Item{Bead: rec.BeadID, Reason: Stalled, AgentID: rec.ID, At: rec.StartedAt}, true
@@ -198,7 +204,6 @@ func fromGraph(graph *beads.Graph) []Item {
 			items = append(items, Item{Bead: id, Reason: Blocked, Detail: is.Title})
 		}
 	}
-	sort.Slice(items, func(i, j int) bool { return items[i].Bead < items[j].Bead })
 	return items
 }
 

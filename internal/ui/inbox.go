@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"net/url"
 	"os/exec"
 	"strings"
 	"time"
@@ -16,7 +17,7 @@ import (
 // live view of its own agents plus the last registry and graph snapshots. It is
 // derived rather than stored so it can never disagree with what the board shows.
 func (m model) attentionItems() []attention.Item {
-	return attention.Collect(m.mgr.Snapshot(), m.agentRecords, m.pulls, m.graph, time.Now())
+	return attention.Collect(m.mgr.Snapshot(), m.agentRecords, m.agentAlive, m.pulls, m.graph, time.Now())
 }
 
 // openInbox shows the board-wide attention list, parking the cursor on the top
@@ -29,7 +30,12 @@ func (m model) openInbox() (tea.Model, tea.Cmd) {
 
 func (m model) handleInboxKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	items := m.attentionItems()
+	// The list shrinks under the cursor whenever an item resolves itself — an
+	// agent finishes, a PR merges — so clamp before acting on the selection.
+	m.inboxCursor = min(m.inboxCursor, max(len(items)-1, 0))
 	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
 	case "esc", "i", "q":
 		m.inboxOpen = false
 		return m, nil
@@ -57,14 +63,17 @@ func (m model) handleInboxKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// openURL hands a pull request to the browser. A board-side failure to launch
-// one is not worth interrupting the user over, so the result is dropped.
-func openURL(url string) tea.Cmd {
-	if url == "" {
+// openURL hands a pull request to the browser. The URL comes from GitHub's API
+// rather than from a PR author, but it is checked anyway before being handed to a
+// launcher: `open` getopt-parses a leading dash, and a non-https scheme would be
+// dispatched to whatever handler claims it.
+func openURL(raw string) tea.Cmd {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.Host == "" {
 		return nil
 	}
 	return func() tea.Msg {
-		_ = exec.Command("open", url).Run()
+		_ = exec.Command(browserOpener, raw).Run()
 		return nil
 	}
 }
@@ -81,30 +90,28 @@ func (m model) jumpToBead(bead string) (tea.Model, tea.Cmd) {
 	if !m.graph.Issues[bead].IsEpic() {
 		epic = m.graph.EpicOf(bead)
 	}
-	for i, id := range m.graph.Epics {
-		if id != epic {
-			continue
-		}
-		m.epicCursor = i
-		m.taskCursor = 0
-		m.taskOpen = false
-		m.focused = false
-		m.tab = tabDetails
-		if epic != bead {
-			for j, task := range m.graph.Tasks[epic] {
-				if task == bead {
-					m.taskCursor = j
-					m.focused = true
-					m.section = secTasks
-					break
-				}
-			}
-		}
-		m.clampCursors()
-		m.syncDetail()
-		return m, m.commentsCmd()
+	// The cursors index the *visible* lists, not the graph's, so a jump taken
+	// while a search filter is active has to resolve against the same view every
+	// other cursor writer uses — otherwise it selects the wrong epic.
+	i := indexOf(m.visibleEpics(), epic)
+	if i < 0 {
+		return m, nil
 	}
-	return m, nil
+	m.epicCursor = i
+	m.taskCursor = 0
+	m.taskOpen = false
+	m.focused = false
+	m.tab = tabDetails
+	if epic != bead {
+		if j := indexOf(m.visibleTasks(), bead); j >= 0 {
+			m.taskCursor = j
+			m.focused = true
+			m.section = secTasks
+		}
+	}
+	m.clampCursors()
+	m.syncDetail()
+	return m, m.commentsCmd()
 }
 
 // inboxView lists every attention item board-wide: what wants you, which bead,
@@ -123,12 +130,14 @@ func (m model) inboxView(width, height int) string {
 	start := windowStart(len(items), m.inboxCursor, rows)
 	for i := start; i < len(items) && i < start+rows; i++ {
 		it := items[i]
+		// Both rows carry the same two-space lead so the columns don't shift as
+		// the cursor moves; the highlight just paints over it.
 		reason, subject := fmt.Sprintf("%-12s", it.Reason), fmt.Sprintf("%-16s", it.Subject())
-		detailW := max(width-lipgloss.Width(reason)-lipgloss.Width(subject)-3, 4)
+		detailW := max(width-lipgloss.Width(reason)-lipgloss.Width(subject)-4, 4)
 		detail := truncate(firstLine(it.Detail), detailW)
 		if i == m.inboxCursor {
 			// Re-render plainly so the highlight background reads cleanly.
-			plain := fmt.Sprintf("%s %s %s", reason, subject, detail)
+			plain := fmt.Sprintf("  %s %s %s", reason, subject, detail)
 			b.WriteString(selectedStyle.Width(width).Render(truncate(plain, width)))
 		} else {
 			colored := lipgloss.NewStyle().Foreground(reasonColor(it.Reason)).Render(reason)
@@ -146,10 +155,8 @@ func reasonColor(r attention.Reason) lipgloss.Color {
 	switch r {
 	case attention.NeedsInput:
 		return yellow
-	case attention.Failed:
-		return lipgloss.Color("203")
-	case attention.ChangesRequested, attention.ChecksFailing, attention.Conflicted:
-		return lipgloss.Color("203")
+	case attention.Failed, attention.ChangesRequested, attention.ChecksFailing, attention.Conflicted:
+		return red
 	case attention.ReviewRequired:
 		return cyan
 	case attention.ReadyToMerge:
