@@ -21,7 +21,9 @@ import (
 	"github.com/pavlabs/beadsboard/internal/config"
 )
 
-const refreshInterval = time.Second
+// refreshInterval paces the watcher. Each poll is a full `bd export` (~0.4s on a
+// 126-bead project), so this is deliberately slower than a filesystem stat loop.
+const refreshInterval = 2 * time.Second
 
 type model struct {
 	client *beads.Client
@@ -79,8 +81,8 @@ type model struct {
 	pickerMode    int    // pickCoding | pickPlanning
 	pickerBackend int    // pickClaude | pickCodex
 
-	fp    uint64
-	hasFP bool
+	rev    uint64 // revision hash of the issue data behind the current graph
+	hasRev bool
 
 	subLinked map[string]bool // task issue URLs already linked as GitHub sub-issues
 
@@ -140,13 +142,16 @@ var editStatuses = []string{"open", "in_progress", "blocked", "closed"}
 type (
 	hydratedMsg struct {
 		graph *beads.Graph
-		fp    uint64 // fingerprint measured just after load, used as the new baseline
+		rev   uint64 // revision of the loaded data, adopted as the new baseline
 		err   error
 	}
 	tickMsg struct{}
-	fpMsg   struct {
-		fp  uint64
-		err error
+	// polledMsg carries a watcher poll: the same load hydrate does, but adopted
+	// only when its revision differs from the one on screen.
+	polledMsg struct {
+		graph *beads.Graph
+		rev   uint64
+		err   error
 	}
 	editSavedMsg  struct{ err error }
 	deletedMsg    struct{ err error }
@@ -154,7 +159,7 @@ type (
 	spawnedMsg    struct{ err error }
 	interveneMsg  struct{ err error }
 	pushedMsg     struct {
-		fp  uint64 // fingerprint after the push, to re-baseline and not self-trigger
+		rev uint64 // revision after the push, to re-baseline and not self-trigger
 		err error
 	}
 	pulledMsg struct {
@@ -238,28 +243,35 @@ func (m model) waitAgentEvent() tea.Cmd {
 }
 
 func (m model) hydrateCmd() tea.Cmd {
-	dir := m.client.Dir
+	client := m.client
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		issues, err := m.client.Load(ctx)
+		graph, rev, err := load(client)
 		if err != nil {
 			return hydratedMsg{err: err}
 		}
-		// `bd export` itself churns Dolt's journal, so snapshot the fingerprint
-		// after loading; that becomes the baseline the watcher compares against,
-		// leaving only external writes to trigger the next reload.
-		fp, _ := beads.Fingerprint(dir)
-		return hydratedMsg{graph: beads.BuildGraph(issues), fp: fp}
+		return hydratedMsg{graph: graph, rev: rev}
 	}
 }
 
-func (m model) fpCmd() tea.Cmd {
-	dir := m.client.Dir
+// pollCmd is the watcher: the same load, whose revision the handler compares
+// against the one on screen. Polling by loading rather than by stat'ing .beads
+// is what keeps our own `bd` reads from reading as somebody else's write.
+func (m model) pollCmd() tea.Cmd {
+	client := m.client
 	return func() tea.Msg {
-		fp, err := beads.Fingerprint(dir)
-		return fpMsg{fp: fp, err: err}
+		graph, rev, err := load(client)
+		return polledMsg{graph: graph, rev: rev, err: err}
 	}
+}
+
+func load(client *beads.Client) (*beads.Graph, uint64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	issues, rev, err := client.Load(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	return beads.BuildGraph(issues), rev, nil
 }
 
 func tickCmd() tea.Cmd {
@@ -292,14 +304,33 @@ func (m model) startReload() (tea.Model, tea.Cmd) {
 	return m, tea.Batch(m.spinner.Tick, m.hydrateCmd())
 }
 
+// adopt installs a freshly loaded graph and its revision as the new baseline.
+// Both an explicit hydrate and a watcher poll land here, so the two paths cannot
+// drift on what adopting a load entails.
+func (m model) adopt(graph *beads.Graph, rev uint64) (tea.Model, tea.Cmd) {
+	m.err = nil
+	m.graph = graph
+	m.rev, m.hasRev = rev, true
+	m.clampCursors()
+	m.syncDetail()
+	if m.cfg.GitHubSync {
+		// Push changed beads to their repos; hold loading so the watcher can't
+		// fire a concurrent push mid-sync. pushedMsg clears loading.
+		m.loading = true
+		return m, m.pushGroupsCmd()
+	}
+	m.loading = false
+	return m, nil
+}
+
 // pushGroupsCmd pushes every bead to its GitHub repo after a load, grouped by
 // the repo its repo:: label resolves to (all beads share the default repo in a
 // single-repo project). Runs after hydrate so it can group from the fresh graph;
 // the caller holds the loading flag until pushedMsg so the watcher can't fire a
-// concurrent push. It re-baselines the fingerprint to the post-push state so its
-// own writes don't trigger another reload.
+// concurrent push. Pushing stamps external refs back onto the beads, so it
+// re-reads the revision afterwards to adopt its own writes as the baseline.
 func (m model) pushGroupsCmd() tea.Cmd {
-	client, cfg, dir := m.client, m.cfg, m.client.Dir
+	client, cfg := m.client, m.cfg
 	groups := map[string][]string{}
 	for id, is := range m.graph.Issues {
 		if repo := client.RepoFor(is.Labels, cfg.GitHubRepository).GitHub; repo != "" {
@@ -314,8 +345,11 @@ func (m model) pushGroupsCmd() tea.Cmd {
 				return pushedMsg{err: err}
 			}
 		}
-		fp, _ := beads.Fingerprint(dir)
-		return pushedMsg{fp: fp}
+		_, rev, err := client.Load(ctx)
+		if err != nil {
+			return pushedMsg{} // no usable baseline; the next poll re-establishes one
+		}
+		return pushedMsg{rev: rev}
 	}
 }
 
@@ -415,23 +449,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = msg.err
 			return m, nil
 		}
-		m.err = nil
-		m.graph = msg.graph
-		m.fp, m.hasFP = msg.fp, true // baseline absorbs our own export's churn
-		m.clampCursors()
-		m.syncDetail()
-		if m.cfg.GitHubSync {
-			// Push changed beads to their repos; hold loading so the watcher can't
-			// fire a concurrent push mid-sync. pushedMsg clears loading.
-			return m, m.pushGroupsCmd()
-		}
-		m.loading = false
-		return m, nil
+		return m.adopt(msg.graph, msg.rev)
 
 	case tickMsg:
 		m.reloadConfigIfChanged()
 		m.mgr.PruneRecent(time.Duration(m.cfg.RecentTTLSecs) * time.Second)
-		return m, tea.Batch(m.fpCmd(), tickCmd(), m.regCmd(), m.commentsCmd())
+		cmds := []tea.Cmd{tickCmd(), m.regCmd(), m.commentsCmd()}
+		if !m.loading {
+			// A poll shells out to bd; skip it while a load or push already holds
+			// the board, rather than contending with it for the Dolt engine.
+			cmds = append(cmds, m.pollCmd())
+		}
+		return m, tea.Batch(cmds...)
 
 	case agentEventMsg:
 		m.clampAgentCursor()
@@ -451,16 +480,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case fpMsg:
-		// Reload only when an external bd write moved the state away from the
-		// baseline captured after our last load.
-		if msg.err != nil || !m.hasFP || m.loading {
+	case polledMsg:
+		// Adopt only when the issue data moved away from what's on screen. The
+		// poll already carries the fresh graph, so an adopted change needs no
+		// second load and never flashes the loading state.
+		if msg.err != nil || m.loading {
 			return m, nil
 		}
-		if msg.fp != m.fp {
-			return m.startReload() // external write: reload, then hydrate pushes it up
+		if m.hasRev && msg.rev == m.rev {
+			return m, nil
 		}
-		return m, nil
+		return m.adopt(msg.graph, msg.rev)
 
 	case editSavedMsg:
 		if msg.err != nil {
@@ -484,8 +514,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.notice = msg.err.Error()
 			return m, nil
 		}
-		if msg.fp != 0 {
-			m.fp = msg.fp // absorb the push's own writes so it doesn't self-trigger
+		if msg.rev != 0 {
+			m.rev = msg.rev // absorb the push's own writes so it doesn't self-trigger
 		}
 		return m, m.linkSubIssuesCmd() // mirror the epic→task hierarchy as sub-issues
 
