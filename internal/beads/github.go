@@ -7,9 +7,57 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 )
+
+// ChangedForSync lists the beads whose GitHub-visible state moved between two
+// loads, plus any that have no issue yet. It is what the board pushes, rather
+// than the whole board: one edit should cost one issue update, and a reload that
+// changed nothing should cost no API calls at all.
+//
+// With no previous graph — the first load of a session — only never-synced beads
+// are returned. Beads that already have an issue are taken to be in step from
+// the last session; pushing all of them on every startup to prove it is what
+// made a single title edit take minutes.
+func ChangedForSync(prev, next *Graph) []string {
+	if next == nil {
+		return nil
+	}
+	var ids []string
+	for id, is := range next.Issues {
+		if id == orphanEpicID {
+			// The orphan bucket is a display device, not a bead. It carries no
+			// external ref, so it would otherwise look like something to create.
+			continue
+		}
+		if is.ExternalRef == "" {
+			ids = append(ids, id) // no issue yet: it has to be created
+			continue
+		}
+		if prev == nil {
+			continue
+		}
+		before, existed := prev.Issues[id]
+		if !existed || syncedFieldsDiffer(before, is) {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+// syncedFieldsDiffer reports whether anything mirrored onto the issue moved.
+// Dependencies are excluded: they drive sub-issue linking, not the issue itself.
+func syncedFieldsDiffer(a, b Issue) bool {
+	return a.Title != b.Title ||
+		a.Status != b.Status ||
+		a.Priority != b.Priority ||
+		a.Description != b.Description ||
+		a.Notes != b.Notes ||
+		!slices.Equal(a.Labels, b.Labels)
+}
 
 // statusLabelPrefix is bd's carrier for a bead's rich status on the issue
 // (status::in_progress, status::blocked, …) — the key::value house style bd's

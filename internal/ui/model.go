@@ -346,49 +346,76 @@ func (m model) startReload() (tea.Model, tea.Cmd) {
 // Both an explicit hydrate and a watcher poll land here, so the two paths cannot
 // drift on what adopting a load entails.
 func (m model) adopt(graph *beads.Graph, rev uint64) (tea.Model, tea.Cmd) {
+	// Diff against what was on screen before adopting, so only the beads that
+	// actually moved get pushed.
+	changed := beads.ChangedForSync(m.graph, graph)
+
 	m.err = nil
 	m.graph = graph
 	m.rev, m.hasRev = rev, true
 	m.clampCursors()
 	m.syncDetail()
 	if m.cfg.GitHubSync {
-		// Push changed beads to their repos; hold loading so the watcher can't
-		// fire a concurrent push mid-sync. pushedMsg clears loading.
-		m.loading = true
-		return m, m.pushGroupsCmd()
+		// Hold loading so the watcher can't fire a concurrent push mid-sync;
+		// pushedMsg clears it. A load that changed nothing pushes nothing.
+		if cmd := m.pushGroupsCmd(changed); cmd != nil {
+			m.loading = true
+			return m, cmd
+		}
 	}
 	m.loading = false
 	return m, nil
 }
 
-// pushGroupsCmd pushes every bead to its GitHub repo after a load, grouped by
-// the repo its repo:: label resolves to (all beads share the default repo in a
-// single-repo project). Runs after hydrate so it can group from the fresh graph;
-// the caller holds the loading flag until pushedMsg so the watcher can't fire a
-// concurrent push. Pushing stamps external refs back onto the beads, so it
-// re-reads the revision afterwards to adopt its own writes as the baseline.
-func (m model) pushGroupsCmd() tea.Cmd {
+// pushGroupsCmd pushes the given beads to their GitHub repos, grouped by the
+// repo each one's repo:: label resolves to (all beads share the default repo in a
+// single-repo project). The caller holds the loading flag until pushedMsg so the
+// watcher can't fire a concurrent push. Pushing stamps external refs back onto
+// the beads, so it re-reads the revision afterwards to adopt its own writes as
+// the baseline. Nothing to push means no command at all.
+func (m model) pushGroupsCmd(ids []string) tea.Cmd {
 	client, cfg := m.client, m.cfg
 	groups := map[string][]string{}
-	for id, is := range m.graph.Issues {
+	for _, id := range ids {
+		is, ok := m.graph.Issues[id]
+		if !ok {
+			// A bead that isn't on the board has nothing to push. Without this an
+			// unknown id would carry no labels and so resolve to the default repo.
+			continue
+		}
 		if repo := client.RepoFor(is.Labels, cfg.GitHubRepository).GitHub; repo != "" {
 			groups[repo] = append(groups[repo], id)
 		}
 	}
+	if len(groups) == 0 {
+		return nil
+	}
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-		defer cancel()
 		for repo, ids := range groups {
-			if err := client.SyncIssues(ctx, ids, repo); err != nil {
+			// A deadline per repo, sized to its batch: one slow or oversized repo
+			// must not eat the budget the others still need.
+			ctx, cancel := context.WithTimeout(context.Background(), syncTimeout(len(ids)))
+			err := client.SyncIssues(ctx, ids, repo)
+			cancel()
+			if err != nil {
 				return pushedMsg{err: err}
 			}
 		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
 		_, rev, err := client.Load(ctx)
 		if err != nil {
 			return pushedMsg{} // no usable baseline; the next poll re-establishes one
 		}
 		return pushedMsg{rev: rev}
 	}
+}
+
+// syncTimeout budgets one repo's push: a fixed allowance for bd's Dolt cold
+// start plus room per bead, so a routine one-bead edit isn't held to the same
+// ceiling as a first-time sync of a whole epic.
+func syncTimeout(beads int) time.Duration {
+	return 15*time.Second + time.Duration(beads)*3*time.Second
 }
 
 // linkSubIssuesCmd mirrors the bd epic→task hierarchy on GitHub as native
