@@ -133,7 +133,7 @@ func (m model) footerLine() string {
 	var keys string
 	switch {
 	case m.tab == tabAgents:
-		keys = "↑/↓ select · enter intervene · k kill · x dismiss · A all · S settings · m back"
+		keys = "↑/↓ select · enter intervene · k kill · x dismiss · w wrap · A all · S settings · m back"
 	case m.editing:
 		switch m.editSec {
 		case secStatus, secPriority:

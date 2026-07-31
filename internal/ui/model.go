@@ -73,6 +73,7 @@ type model struct {
 	agentCursor     int  // selected agent in the Agents tab
 	beadAgentCursor int  // selected row in a task detail page's per-bead agents ledger
 	showAll         bool // Agents tab: all agents vs scoped to the hovered epic
+	wrapLogs        bool // Agents tab: wrap log lines instead of truncating them
 	notice          string
 
 	pendingDelete string // bead id awaiting a delete confirmation; "" = none
