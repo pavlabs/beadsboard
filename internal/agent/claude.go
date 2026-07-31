@@ -95,7 +95,7 @@ func assistantText(ev map[string]any) string {
 					}
 				case "tool_use":
 					if n, _ := cm["name"].(string); n != "" {
-						parts = append(parts, "→ "+n)
+						parts = append(parts, "→ "+toolLine(n, cm["input"]))
 					}
 				}
 			}
@@ -108,6 +108,42 @@ func assistantText(ev map[string]any) string {
 		return firstLine(t)
 	}
 	return ""
+}
+
+// toolArg names the field worth showing for each tool: a bare "Bash" or "Read"
+// says nothing about what the agent is doing. Anything not listed degrades to
+// just its name rather than disappearing.
+var toolArg = map[string]string{
+	"Bash":         "command",
+	"Read":         "file_path",
+	"Edit":         "file_path",
+	"Write":        "file_path",
+	"NotebookEdit": "notebook_path",
+	"Glob":         "pattern",
+	"Grep":         "pattern",
+	"WebFetch":     "url",
+	"WebSearch":    "query",
+	"Task":         "description",
+	"Skill":        "command",
+}
+
+// toolLine renders a tool call as "<name>: <what it acted on>". The value is
+// kept whole — it is posted to the bead's timeline as well as shown in the log,
+// so the pane truncates at render rather than losing it here.
+func toolLine(name string, rawInput any) string {
+	input, ok := rawInput.(map[string]any)
+	if !ok {
+		return name
+	}
+	key, ok := toolArg[name]
+	if !ok {
+		return name
+	}
+	v, _ := input[key].(string)
+	if v = strings.TrimSpace(firstLine(v)); v == "" {
+		return name
+	}
+	return name + ": " + v
 }
 
 func resultText(ev map[string]any) string {
