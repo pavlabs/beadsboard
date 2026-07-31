@@ -297,22 +297,36 @@ func (m model) handleAgentsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.agentCursor++
 		}
 	case "k":
-		if a, ok := m.selectedAgent(); ok && a.Status == agent.Running {
-			m.mgr.Kill(a.ID)
+		if r, ok := m.selectedAgent(); ok {
+			if !r.managed() {
+				m.notice = notManagedHere
+				return m, nil
+			}
+			if r.view.Status == agent.Running {
+				m.mgr.Kill(r.id())
+			}
 		}
 	case "x":
-		if a, ok := m.selectedAgent(); ok {
-			m.mgr.Dismiss(a.ID)
+		if r, ok := m.selectedAgent(); ok {
+			if !r.managed() {
+				m.notice = notManagedHere
+				return m, nil
+			}
+			m.mgr.Dismiss(r.id())
 			m.clampAgentCursor()
 		}
 	case "enter":
-		if a, ok := m.selectedAgent(); ok {
-			cwd, sess, err := m.mgr.Intervene(a.ID)
-			if err != nil {
-				m.notice = "can't resume " + shortID(a.IssueID) + ": " + err.Error()
+		if r, ok := m.selectedAgent(); ok {
+			if !r.managed() {
+				m.notice = notManagedHere
 				return m, nil
 			}
-			return m, interveneCmd(cwd, sess, m.mgr.Backend(a.Tool))
+			cwd, sess, err := m.mgr.Intervene(r.id())
+			if err != nil {
+				m.notice = "can't resume " + shortID(r.bead()) + ": " + err.Error()
+				return m, nil
+			}
+			return m, interveneCmd(cwd, sess, m.mgr.Backend(r.tool()))
 		}
 	}
 	return m, nil
@@ -365,30 +379,92 @@ func (m model) dispatchPicker() (tea.Model, tea.Cmd) {
 	return m, m.spawnCmd(target, scope, tool)
 }
 
+// notManagedHere is shown for actions that need the in-process Manager. A
+// registry row belongs to another board or an external session, so this board
+// has its record but not its process or its log.
+const notManagedHere = "not run by this board — kill or resume it where it started"
+
+// tabRow is one line in the Agents tab. A row is either backed by this board's
+// own Manager — with a live status and a log tail — or known only from the shared
+// on-disk registry: an externally registered session, another board's agent, or
+// one of ours from before a restart. The registry is the reason the directory
+// exists, so the tab has to read it rather than only this process's memory.
+type tabRow struct {
+	view  *agent.View      // nil for a registry-only row
+	rec   *agentreg.Record // nil for a manager-backed row
+	alive bool             // registry liveness; meaningful only for a registry row
+}
+
+func (r tabRow) managed() bool { return r.view != nil }
+
+func (r tabRow) id() string {
+	if r.view != nil {
+		return r.view.ID
+	}
+	return r.rec.ID
+}
+
+func (r tabRow) bead() string {
+	if r.view != nil {
+		return r.view.IssueID
+	}
+	return r.rec.BeadID
+}
+
+func (r tabRow) tool() agentreg.Tool {
+	if r.view != nil {
+		return r.view.Tool
+	}
+	return r.rec.Tool
+}
+
+// active decides which half of the list a row sits in: a live process, or one
+// whose work is over (or whose owner is gone).
+func (r tabRow) active() bool {
+	if r.view != nil {
+		return r.view.Status.Active()
+	}
+	return r.alive
+}
+
 // visibleAgents lists agents, active first, filtered to the hovered epic unless
 // show-all is on.
-func (m model) visibleAgents() []agent.View {
-	all := m.mgr.Snapshot()
+func (m model) visibleAgents() []tabRow {
+	var rows []tabRow
+	managed := map[string]bool{}
+	for _, a := range m.mgr.Snapshot() {
+		managed[a.ID] = true
+		rows = append(rows, tabRow{view: &a})
+	}
+	// Registry records the Manager doesn't know: another board's agents, external
+	// sessions, and our own from before a restart.
+	for _, rec := range m.agentRecords {
+		if !managed[rec.ID] {
+			rows = append(rows, tabRow{rec: &rec, alive: m.agentAlive[rec.ID]})
+		}
+	}
+
 	epic := m.currentEpic()
-	var active, recent []agent.View
-	for _, a := range all {
-		if !m.showAll && epic != "" && a.IssueID != epic &&
-			(m.graph == nil || m.graph.EpicOf(a.IssueID) != epic) {
+	var active, recent []tabRow
+	for _, r := range rows {
+		bead := r.bead()
+		if !m.showAll && epic != "" && bead != epic &&
+			(m.graph == nil || m.graph.EpicOf(bead) != epic) {
 			continue
 		}
-		if a.Status.Active() {
-			active = append(active, a)
+		if r.active() {
+			active = append(active, r)
 		} else {
-			recent = append(recent, a)
+			recent = append(recent, r)
 		}
 	}
 	return append(active, recent...)
 }
 
-func (m model) selectedAgent() (agent.View, bool) {
+func (m model) selectedAgent() (tabRow, bool) {
 	agents := m.visibleAgents()
 	if m.agentCursor < 0 || m.agentCursor >= len(agents) {
-		return agent.View{}, false
+		return tabRow{}, false
 	}
 	return agents[m.agentCursor], true
 }
@@ -431,7 +507,11 @@ func (m *model) killBeadAgent() {
 	m.clampBeadAgentCursor()
 }
 
-func (m model) hasAgents() bool { return len(m.mgr.Snapshot()) > 0 }
+// hasAgents gates the tab bar. It counts registry records too, so the tab does
+// not vanish across a restart while agents are still registered and running.
+func (m model) hasAgents() bool {
+	return len(m.mgr.Snapshot()) > 0 || len(m.agentRecords) > 0
+}
 
 func (m model) anyNeedsInput() bool {
 	for _, a := range m.mgr.Snapshot() {
@@ -555,7 +635,7 @@ func (m model) agentListContent(width, height int) string {
 
 	activeCount := 0
 	for _, a := range agents {
-		if a.Status.Active() {
+		if a.active() {
 			activeCount++
 		}
 	}
@@ -575,7 +655,11 @@ func (m model) agentListContent(width, height int) string {
 	return b.String()
 }
 
-func (m model) renderAgentRow(a agent.View, selected bool, width int) string {
+func (m model) renderAgentRow(r tabRow, selected bool, width int) string {
+	if !r.managed() {
+		return m.renderRegistryRow(r, selected, width)
+	}
+	a := *r.view
 	summary := a.Summary
 	if a.Status == agent.NeedsInput {
 		summary = a.Question
@@ -595,10 +679,15 @@ func (m model) renderAgentRow(a agent.View, selected bool, width int) string {
 }
 
 func (m model) agentPreviewContent(width, height int) string {
-	a, ok := m.selectedAgent()
+	r, ok := m.selectedAgent()
 	if !ok {
 		return dimStyle.Render("no agent selected")
 	}
+
+	if !r.managed() {
+		return m.registryPreview(r, width)
+	}
+	a := *r.view
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s %s\n", agentGlyph(a.Status),
@@ -755,6 +844,58 @@ type agentRow struct {
 	statusWord string
 	internal   bool       // backed by a live in-process agent (glyph/word from view)
 	view       agent.View // valid only when internal
+}
+
+// renderRegistryRow draws an agent this board only knows from the registry: its
+// bead, who runs it, and whether its process is still there. There is no status
+// or summary to show — those come from the Manager, which never saw it.
+func (m model) renderRegistryRow(r tabRow, selected bool, width int) string {
+	glyph, word := dimStyle.Render("○"), "gone"
+	if r.alive {
+		glyph, word = lipgloss.NewStyle().Foreground(cyan).Render("●"), "running"
+	}
+	detail := fmt.Sprintf("%s · %s · %s", word, r.rec.Tool, r.rec.Source)
+	prefix := fmt.Sprintf("%s %-7s %-4s ", glyph, shortID(r.rec.BeadID), string(r.rec.Mode))
+	line := prefix + truncate(detail, max(width-lipgloss.Width(prefix), 4))
+	if selected {
+		plain := fmt.Sprintf("%s %-7s %-4s %s", markFor(r.alive), shortID(r.rec.BeadID), string(r.rec.Mode), detail)
+		return selectedStyle.Width(width).Render(truncate(plain, width))
+	}
+	return line
+}
+
+func markFor(alive bool) string {
+	if alive {
+		return "●"
+	}
+	return "○"
+}
+
+// registryPreview describes an agent this board did not start. There is no log
+// to show — the tail lives in the process that runs it — so this reports where it
+// is running and how to reach it instead of pretending to be empty.
+func (m model) registryPreview(r tabRow, width int) string {
+	rec := r.rec
+	state := "process gone"
+	if r.alive {
+		state = "running"
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s %s\n", markFor(r.alive),
+		dimStyle.Render(rec.BeadID+" · "+state+" · "+string(rec.Tool)+" · "+string(rec.Mode)))
+	if rec.Branch != "" {
+		b.WriteString(dimStyle.Render("branch "+rec.Branch) + "\n")
+	}
+	if rec.SessionID != "" {
+		b.WriteString(dimStyle.Render("session "+rec.SessionID) + "\n")
+	}
+	if rec.Cwd != "" {
+		b.WriteString(dimStyle.Render(truncate("cwd "+rec.Cwd, max(width, 1))) + "\n")
+	}
+	fmt.Fprintf(&b, "%s\n\n", dimStyle.Render(fmt.Sprintf("pid %d · registered by %s", rec.PID, rec.Source)))
+	b.WriteString(dimStyle.Render(notManagedHere))
+	return b.String()
 }
 
 // beadAgents merges the live in-process agents working beadID with the cached

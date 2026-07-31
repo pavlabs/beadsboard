@@ -152,7 +152,7 @@ func (m model) footerLine() string {
 	case m.focused:
 		keys = "tab section · e edit · ↑/↓ scroll · esc back · q quit"
 	default:
-		keys = "↑/↓ move · → open · / search · w wrap · i inbox · r refresh · q quit"
+		keys = "↑/↓ move · → open · / search · w wrap · i inbox · A agents · r refresh · q quit"
 		if m.cfg.GitHubSync {
 			keys += " · G github-pull"
 		}
