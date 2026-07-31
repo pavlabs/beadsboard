@@ -8,6 +8,7 @@ package agent
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -421,12 +422,31 @@ func (m *Manager) Kill(id string) {
 
 // Intervene kills the headless process but keeps its worktree, returning the
 // working directory and session id so the caller can resume it interactively.
-func (m *Manager) Intervene(id string) (cwd, session string, ok bool) {
+// ErrNoSession and ErrWorktreeGone are why an agent can't be resumed. A session
+// id only exists once the backend has emitted one, and the worktree is the
+// directory the backend keys its session store by — resuming from anywhere else
+// finds no session — so a finished agent whose worktree was cleaned up cannot be
+// resumed at all.
+var (
+	ErrNoSession    = errors.New("no session captured yet")
+	ErrWorktreeGone = errors.New("worktree is gone, so its session can't be found")
+	ErrUnknownAgent = errors.New("agent is not tracked by this board")
+)
+
+func (m *Manager) Intervene(id string) (cwd, session string, err error) {
 	m.mu.Lock()
 	a := m.find(id)
-	if a == nil || a.Session == "" {
+	if a == nil {
 		m.mu.Unlock()
-		return "", "", false
+		return "", "", ErrUnknownAgent
+	}
+	if a.Session == "" {
+		m.mu.Unlock()
+		return "", "", ErrNoSession
+	}
+	if !a.worktreePresent || !dirExists(a.worktree) {
+		m.mu.Unlock()
+		return "", "", ErrWorktreeGone
 	}
 	a.intervened = true
 	cancel, wt, sess := a.cancel, a.worktree, a.Session
@@ -440,7 +460,18 @@ func (m *Manager) Intervene(id string) (cwd, session string, ok bool) {
 	} else {
 		m.ping()
 	}
-	return wt, sess, true
+	return wt, sess, nil
+}
+
+// dirExists reports whether path is a directory that is still there. The
+// worktree lives under $TMPDIR, which is reaped out from under a long-lived
+// board, so the recorded flag alone is not proof.
+func dirExists(path string) bool {
+	if path == "" {
+		return false
+	}
+	fi, err := os.Stat(path)
+	return err == nil && fi.IsDir()
 }
 
 // Dismiss removes an agent from the registry and cleans up any worktree it still

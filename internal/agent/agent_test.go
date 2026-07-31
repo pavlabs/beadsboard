@@ -219,3 +219,43 @@ func TestSpawnRespectsMaxAgents(t *testing.T) {
 	_, err = m.Spawn(Spec{IssueID: "b", Prompt: "go", PermissionMode: "acceptEdits"})
 	require.Error(t, err, "second spawn exceeds max=1")
 }
+
+// A finished agent's worktree is deleted, and the backend keys its session store
+// by working directory — so resuming from anywhere else finds no session. Refuse
+// rather than open a pane that cannot work.
+func TestIntervenNeedsAWorktree(t *testing.T) {
+	m := New(t.TempDir(), "claude", 2)
+	a := &agent{View: View{ID: "a1", IssueID: "bd-1", Session: "sess-1", Status: NeedsInput}}
+	a.worktree = t.TempDir()
+	a.worktreePresent = true
+	m.agents = append(m.agents, a)
+
+	cwd, sess, err := m.Intervene("a1")
+	require.NoError(t, err)
+	require.Equal(t, a.worktree, cwd)
+	require.Equal(t, "sess-1", sess)
+
+	// The flag says present, but the directory is gone (finished agent, or a
+	// reaped $TMPDIR).
+	require.NoError(t, os.RemoveAll(a.worktree))
+	_, _, err = m.Intervene("a1")
+	require.ErrorIs(t, err, ErrWorktreeGone)
+
+	// Cleanup already cleared the flag.
+	a.worktreePresent = false
+	_, _, err = m.Intervene("a1")
+	require.ErrorIs(t, err, ErrWorktreeGone)
+}
+
+// Distinguish "not resumable yet" from "not resumable any more", so the board can
+// say which.
+func TestIntervenReportsWhy(t *testing.T) {
+	m := New(t.TempDir(), "claude", 2)
+	m.agents = append(m.agents, &agent{View: View{ID: "a2", IssueID: "bd-2", Status: Running}})
+
+	_, _, err := m.Intervene("a2")
+	require.ErrorIs(t, err, ErrNoSession)
+
+	_, _, err = m.Intervene("nope")
+	require.ErrorIs(t, err, ErrUnknownAgent)
+}

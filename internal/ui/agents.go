@@ -155,6 +155,12 @@ func interveneCmd(cwd, session string, b agent.Backend) tea.Cmd {
 		if os.Getenv("ZELLIJ") == "" {
 			return interveneMsg{err: fmt.Errorf("not in zellij — resume manually: cd %s && %s", cwd, strings.Join(resume, " "))}
 		}
+		// zellij drops the pane in $HOME rather than failing when --cwd does not
+		// exist, and the backend then resumes from the wrong directory and reports
+		// no such session. Refuse instead of opening a pane that cannot work.
+		if fi, err := os.Stat(cwd); err != nil || !fi.IsDir() {
+			return interveneMsg{err: fmt.Errorf("worktree is gone: %s", cwd)}
+		}
 		name := "resume " + session
 		if len(name) > 24 {
 			name = name[:24]
@@ -166,6 +172,45 @@ func interveneCmd(cwd, session string, b agent.Backend) tea.Cmd {
 		}
 		return interveneMsg{}
 	}
+}
+
+// tailLines renders the last log lines that fit in rows. Wrapping makes one log
+// line occupy several rows, so the window is filled from the newest line
+// backwards by rendered height rather than by line count.
+func tailLines(tail []string, width, rows int, wrap bool) []string {
+	if !wrap {
+		if len(tail) > rows {
+			tail = tail[len(tail)-rows:]
+		}
+		out := make([]string, len(tail))
+		for i, l := range tail {
+			out[i] = truncate(l, width)
+		}
+		return out
+	}
+
+	style := lipgloss.NewStyle().Width(max(width, 1))
+	var out []string
+	used := 0
+	for i := len(tail) - 1; i >= 0; i-- {
+		// Width() pads as well as wraps; trim it back so a wrapped row is the same
+		// shape as an unwrapped one.
+		block := strings.Split(style.Render(tail[i]), "\n")
+		for j, row := range block {
+			block[j] = strings.TrimRight(row, " ")
+		}
+		if used+len(block) > rows {
+			// A block that only partly fits keeps its newest rows, so the most
+			// recent line is never the one dropped.
+			if room := rows - used; room > 0 && len(out) == 0 {
+				out = append(block[len(block)-room:], out...)
+			}
+			break
+		}
+		out = append(block, out...)
+		used += len(block)
+	}
+	return out
 }
 
 // planCmd opens an interactive planning session for a bead in a floating zellij
@@ -238,6 +283,9 @@ func (m model) handleAgentsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "A":
 		m.showAll = !m.showAll
 		m.clampAgentCursor()
+	case "w":
+		// Board-wide, not per agent: moving through the list must not reset it.
+		m.wrapLogs = !m.wrapLogs
 	case "S":
 		m.openSettings()
 	case "up":
@@ -259,10 +307,12 @@ func (m model) handleAgentsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "enter":
 		if a, ok := m.selectedAgent(); ok {
-			if cwd, sess, ok := m.mgr.Intervene(a.ID); ok {
-				return m, interveneCmd(cwd, sess, m.mgr.Backend(a.Tool))
+			cwd, sess, err := m.mgr.Intervene(a.ID)
+			if err != nil {
+				m.notice = "can't resume " + shortID(a.IssueID) + ": " + err.Error()
+				return m, nil
 			}
-			m.notice = "no session captured yet — can't resume"
+			return m, interveneCmd(cwd, sess, m.mgr.Backend(a.Tool))
 		}
 	}
 	return m, nil
@@ -565,21 +615,11 @@ func (m model) agentPreviewContent(width, height int) string {
 		return b.String()
 	}
 
-	tail := a.Tail
-	rows := max(height-4, 1)
-	if len(tail) > rows {
-		tail = tail[len(tail)-rows:]
-	}
-	if len(tail) == 0 {
+	if len(a.Tail) == 0 {
 		b.WriteString(dimStyle.Render("… starting"))
 		return b.String()
 	}
-	for i, l := range tail {
-		b.WriteString(truncate(l, width))
-		if i < len(tail)-1 {
-			b.WriteByte('\n')
-		}
-	}
+	b.WriteString(strings.Join(tailLines(a.Tail, width, max(height-4, 1), m.wrapLogs), "\n"))
 	return b.String()
 }
 
