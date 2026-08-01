@@ -136,7 +136,65 @@ func TestSpawnPostsLifecycleComments(t *testing.T) {
 	joined := strings.Join(fc.all(), "\n")
 	require.Contains(t, joined, "epic-x bb-agent spawn agent=epic-x-1 tool=claude mode=coding branch=beadsboard/epic-x-1")
 	require.Contains(t, joined, "epic-x bb-agent session agent=epic-x-1 session=sess-123")
-	require.Contains(t, joined, "epic-x bb-agent finish agent=epic-x-1 status=done result=All done.")
+	require.Contains(t, joined, "epic-x bb-agent finish agent=epic-x-1 status=done branch=beadsboard/epic-x-1 result=All done.")
+	require.NotContains(t, joined, "pr=", "an agent that opened no PR still posts a usable finish comment")
+}
+
+// The finish comment is the bead's link to the durable artifact, so a PR the
+// agent announced has to reach the timeline alongside the branch.
+func TestFinishCommentCarriesPRLink(t *testing.T) {
+	repo := gitRepo(t)
+	bin := stubClaude(
+		t,
+		`{"type":"result","result":"Opened https://github.com/pavlabs/beadsboard/pull/43 for review."}`,
+	)
+	m := newAt(repo, bin, 10, t.TempDir())
+	fc := &fakeCommenter{}
+	m.SetCommenter(fc)
+
+	_, err := m.Spawn(Spec{IssueID: "task-9", Scope: "task", Prompt: "go", PermissionMode: "acceptEdits"})
+	require.NoError(t, err)
+	waitTerminal(t, m)
+
+	require.Eventually(t, func() bool {
+		return strings.Contains(strings.Join(fc.all(), "\n"), "finish")
+	}, 5*time.Second, 20*time.Millisecond)
+	require.Contains(t, strings.Join(fc.all(), "\n"),
+		"task-9 bb-agent finish agent=task-9-1 status=done branch=beadsboard/task-9-1 "+
+			"pr=https://github.com/pavlabs/beadsboard/pull/43 result=Opened")
+}
+
+// Codex reports narration and its final answer through the same result events, so
+// a PR announced mid-run must not be lost by the results that follow it.
+func TestPRLinkSurvivesLaterResults(t *testing.T) {
+	m := New(t.TempDir(), "claude", 1)
+	a := &agent{View: View{ID: "a1"}, backend: claudeBackend{bin: "claude"}}
+
+	m.ingest(a, []byte(`{"type":"result","result":"Pushed, PR at https://github.com/o/r/pull/7"}`))
+	m.ingest(a, []byte(`{"type":"result","result":"Cleaned up the worktree."}`))
+
+	require.Equal(t, "https://github.com/o/r/pull/7", a.pullRequest)
+}
+
+// Only a real pull-request link may be posted as one: the result text is agent
+// prose and mentions plenty of other URLs.
+func TestPRURL(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want string
+	}{
+		{"github pr", "see https://github.com/pavlabs/beadsboard/pull/43 thanks", "https://github.com/pavlabs/beadsboard/pull/43"},
+		{"enterprise host", "https://git.corp.example.com:8443/team/app/pull/1", "https://git.corp.example.com:8443/team/app/pull/1"},
+		{"trailing punctuation", "opened https://github.com/o/r/pull/9.", "https://github.com/o/r/pull/9"},
+		{"issue link is not a pr", "closes https://github.com/o/r/issues/12", ""},
+		{"no link", "All done.", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, prURL(tt.text))
+		})
+	}
 }
 
 // A run that ends with the marker becomes NeedsInput, keeps its question, and
