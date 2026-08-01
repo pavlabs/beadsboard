@@ -25,6 +25,14 @@ import (
 // 126-bead project), so this is deliberately slower than a filesystem stat loop.
 const refreshInterval = 2 * time.Second
 
+// commentsInterval is the floor under which an unchanged timeline is not
+// re-fetched. `bd comments` is a second bd process contending with the poll's
+// export for the same embedded Dolt engine, so refetching it every tick doubles
+// an idle board's cost. It cannot be gated on the revision alone: comments are
+// not part of the export revision, so an agent posting one moves nothing the
+// board can observe — this cadence is what surfaces it without a manual reload.
+const commentsInterval = 30 * time.Second
+
 // pullsInterval paces the pull-request fetch. It costs a GitHub API call, which
 // is rate limited and far slower to change than local bead state, so it runs on
 // its own clock rather than with every board refresh.
@@ -68,6 +76,8 @@ type model struct {
 
 	commentBead string          // bead the cached comments belong to; "" = none
 	comments    []beads.Comment // selected bead's activity timeline, read off the render path
+	commentsRev uint64          // revision on screen when the cached timeline was fetched
+	commentsAt  time.Time       // when that fetch was issued; zero means never
 
 	tab             int  // tabDetails | tabAgents
 	agentCursor     int  // selected agent in the Agents tab
@@ -360,6 +370,24 @@ func (m model) commentsCmd() tea.Cmd {
 	}
 }
 
+// refreshCommentsCmd is the tick's gated timeline fetch: it re-reads only when
+// the cached timeline can no longer be trusted — the target moved, a poll
+// adopted a new revision, or the cache aged past commentsInterval. The clock
+// starts when the fetch is issued rather than when it lands, so a read slower
+// than a tick does not immediately look overdue again.
+func (m *model) refreshCommentsCmd() tea.Cmd {
+	bead := m.target()
+	if bead == "" {
+		return nil
+	}
+	fresh := bead == m.commentBead && m.rev == m.commentsRev && time.Since(m.commentsAt) < commentsInterval
+	if fresh {
+		return nil
+	}
+	m.commentsRev, m.commentsAt = m.rev, time.Now()
+	return m.commentsCmd()
+}
+
 // openBeadCmd opens the selected bead's synced GitHub issue, the same way o
 // opens a pull request from the inbox. A bead with no issue yet has nothing to
 // open, and says so rather than doing nothing.
@@ -603,7 +631,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		m.reloadConfigIfChanged()
 		m.mgr.PruneRecent(time.Duration(m.cfg.RecentTTLSecs) * time.Second)
-		cmds := []tea.Cmd{tickCmd(), m.regCmd(), m.commentsCmd(), m.pullsCmd()}
+		cmds := []tea.Cmd{tickCmd(), m.regCmd(), m.refreshCommentsCmd(), m.pullsCmd()}
 		if !m.loading {
 			// A poll shells out to bd; skip it while a load or push already holds
 			// the board, rather than contending with it for the Dolt engine.
