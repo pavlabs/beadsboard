@@ -19,6 +19,8 @@ const pullsQuery = `query($q: String!, $n: Int!) {
     nodes {
       ... on PullRequest {
         number title url isDraft updatedAt mergeable reviewDecision headRefName
+        isCrossRepository
+        author { login }
         repository { nameWithOwner }
         closingIssuesReferences(first: 5) { nodes { url } }
         commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
@@ -47,6 +49,8 @@ type PullRequest struct {
 	Title          string
 	URL            string
 	Branch         string
+	Author         string // GitHub login that opened it; "" for a deleted account
+	Fork           bool   // head repo is not the base repo, so the branch is an outsider's name
 	Draft          bool
 	Mergeable      string
 	ReviewDecision string
@@ -140,7 +144,11 @@ func decodePulls(raw []byte) ([]PullRequest, error) {
 					Mergeable      string `json:"mergeable"`
 					ReviewDecision string `json:"reviewDecision"`
 					HeadRefName    string `json:"headRefName"`
-					Repository     struct {
+					CrossRepo      bool   `json:"isCrossRepository"`
+					Author         struct {
+						Login string `json:"login"`
+					} `json:"author"`
+					Repository struct {
 						NameWithOwner string `json:"nameWithOwner"`
 					} `json:"repository"`
 					ClosingIssuesReferences struct {
@@ -176,6 +184,8 @@ func decodePulls(raw []byte) ([]PullRequest, error) {
 			Title:          sanitize(n.Title),
 			URL:            n.URL,
 			Branch:         sanitize(n.HeadRefName),
+			Author:         sanitize(n.Author.Login),
+			Fork:           n.CrossRepo,
 			Draft:          n.IsDraft,
 			Mergeable:      n.Mergeable,
 			ReviewDecision: n.ReviewDecision,
@@ -201,6 +211,12 @@ func decodePulls(raw []byte) ([]PullRequest, error) {
 // branch was cut by an agent (`beadsboard/<id>-<n>`) or an external session
 // (`bead/<id>`). Issue URLs are matched rather than numbers, which collide
 // across a meta-repo's sub-repos. Returns "" when neither convention resolves.
+//
+// A fork's branch name is whatever the outside author typed and carries no
+// permission at all, so it is not trusted to name a bead — otherwise anyone
+// could push `bead/<id>` and have their PR listed as the work for it. A closing
+// reference survives the same test: it names an issue that has to exist, from
+// someone with access to reference it, and GitHub records it as a link.
 func BeadFor(p PullRequest, graph *Graph) string {
 	if graph == nil {
 		return ""
@@ -215,6 +231,9 @@ func BeadFor(p PullRequest, graph *Graph) string {
 				return id
 			}
 		}
+	}
+	if p.Fork {
+		return ""
 	}
 	return beadFromBranch(p.Branch, graph)
 }
