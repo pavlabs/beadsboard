@@ -14,7 +14,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -84,7 +83,6 @@ type agent struct {
 	cancel          context.CancelFunc
 	tail            []string
 	pendingResult   string
-	pullRequest     string // PR link the agent announced, if any
 	killIntent      bool
 	intervened      bool
 	worktreePresent bool
@@ -358,11 +356,6 @@ func (m *Manager) ingest(a *agent, line []byte) {
 	if ev.Result != "" {
 		a.pendingResult = ev.Result
 		a.Summary = beads.Sanitize(firstLine(ev.Result))
-		// Codex narrates through result events too, so a PR announced mid-run has
-		// to survive the later results that don't repeat the link.
-		if u := prURL(ev.Result); u != "" {
-			a.pullRequest = u
-		}
 	}
 	m.mu.Unlock()
 	// Persist the session id once, so a rediscovered agent stays resumable.
@@ -397,13 +390,12 @@ func (m *Manager) finalize(a *agent, waitErr error, logPath string) {
 	}
 	wt, repoDir, id := a.worktree, a.repoDir, a.ID
 	beadID, status, result := a.IssueID, a.Status, a.pendingResult
-	branch, pr := a.Branch, a.pullRequest
 	m.mu.Unlock()
 
 	// The headless process has exited, so drop its registry record regardless of
 	// outcome; a needs-input agent stays visible via the in-memory Snapshot.
 	m.regRemove(id)
-	go m.comment(beadID, finishComment(id, status, branch, pr, result))
+	go m.comment(beadID, finishComment(id, status, result))
 	_ = os.Remove(logPath) // logs are ephemeral; the question/outcome is kept in memory
 	if !keep {
 		m.removeWorktree(repoDir, wt)
@@ -617,30 +609,13 @@ func sessionComment(rec agentreg.Record) string {
 	return fmt.Sprintf("%s session agent=%s session=%s", commentTag, rec.ID, rec.SessionID)
 }
 
-// finishComment closes the bead's agent timeline with where the work landed: the
-// branch it ran on, and the PR link if the agent opened one.
-func finishComment(id string, status Status, branch, pr, result string) string {
+func finishComment(id string, status Status, result string) string {
 	body := fmt.Sprintf("%s finish agent=%s status=%s", commentTag, id, status.label())
-	if branch != "" {
-		body += " branch=" + branch
-	}
-	if pr != "" {
-		body += " pr=" + pr
-	}
 	if r := firstLine(result); r != "" {
 		body += " result=" + r
 	}
 	return body
 }
-
-// prPattern matches a pull-request link in an agent's prose. The host is left
-// open so GitHub Enterprise links count, and the character classes stay narrow so
-// nothing an agent quotes can smuggle whitespace or control bytes into a comment.
-var prPattern = regexp.MustCompile(`https?://[\w.:-]+/[\w./-]*/pull/\d+`)
-
-// prURL returns the first pull-request link in s, or "" when the agent opened no
-// PR — the common case for a run that only investigated or was killed.
-func prURL(s string) string { return prPattern.FindString(s) }
 
 func firstLine(s string) string {
 	s = strings.TrimSpace(s)
