@@ -188,7 +188,11 @@ type (
 	agentEventMsg struct{}
 	spawnedMsg    struct{ err error }
 	interveneMsg  struct{ err error }
-	pushedMsg     struct {
+	copiedMsg     struct {
+		what string
+		err  error
+	}
+	pushedMsg struct {
 		ids []string // beads that reached GitHub, whose digests are now current
 		err error
 	}
@@ -354,6 +358,40 @@ func (m model) commentsCmd() tea.Cmd {
 		}
 		return commentsLoadedMsg{bead: bead, comments: comments}
 	}
+}
+
+// openBeadCmd opens the selected bead's synced GitHub issue, the same way o
+// opens a pull request from the inbox. A bead with no issue yet has nothing to
+// open, and says so rather than doing nothing.
+func (m model) openBeadCmd() tea.Cmd {
+	id := m.target()
+	if m.graph == nil || id == "" {
+		return nil
+	}
+	ref := m.graph.Issues[id].ExternalRef
+	if ref == "" {
+		return func() tea.Msg {
+			return copiedMsg{err: fmt.Errorf("%s has no synced issue yet", beadRef(id))}
+		}
+	}
+	return openURL(ref)
+}
+
+// focusTasks jumps straight into the epic's task list, skipping the tab walk
+// through title, status, priority, description and notes.
+func (m model) focusTasks() (tea.Model, tea.Cmd) {
+	if m.taskOpen || m.graph == nil {
+		return m, nil // a task has no task list of its own
+	}
+	if len(m.visibleTasks()) == 0 {
+		return m, nil
+	}
+	m.focused = true
+	m.section = secTasks
+	m.tab = tabDetails
+	m.clampCursors()
+	m.syncDetail()
+	return m, nil
 }
 
 // startReload flips to the loading state and kicks off a fresh hydrate.
@@ -655,6 +693,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case copiedMsg:
+		if msg.err != nil {
+			m.notice = msg.err.Error()
+			return m, nil
+		}
+		m.notice = "copied: " + firstLine(msg.what)
+		return m, nil
+
 	case regLoadedMsg:
 		m.agentRecords, m.agentAlive = msg.records, msg.alive
 		m.clampBeadAgentCursor()
@@ -728,6 +774,16 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "i":
 		// Board-wide, so it opens from anywhere rather than per-pane.
 		return m.openInbox()
+	case "o":
+		return m, m.openBeadCmd()
+	case "c":
+		text := m.copyText()
+		if text == "" {
+			return m, nil
+		}
+		return m, copyCmd(text)
+	case "t":
+		return m.focusTasks()
 	}
 	if m.tab == tabAgents {
 		return m.handleAgentsKey(msg)

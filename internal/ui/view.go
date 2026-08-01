@@ -146,13 +146,13 @@ func (m model) footerLine() string {
 	case m.taskOpen && m.section == secAgents:
 		keys = "↑/↓ select · x kill · tab field · esc back · q quit"
 	case m.taskOpen:
-		keys = "tab field · e edit · ↑/↓ scroll · esc back · q quit"
+		keys = "tab field · e edit · c copy · o issue · ↑/↓ scroll · esc back · q quit"
 	case m.focused && m.section == secTasks:
-		keys = "↑/↓ task · enter open · / search · tab section · esc back"
+		keys = "↑/↓ task · enter open · c copy · o issue · / search · tab section · esc back"
 	case m.focused:
-		keys = "tab section · e edit · ↑/↓ scroll · esc back · q quit"
+		keys = "tab section · t tasks · e edit · c copy · o issue · esc back · q quit"
 	default:
-		keys = "↑/↓ move · → open · / search · w wrap · i inbox · A agents · r refresh · q quit"
+		keys = "↑/↓ move · → open · t tasks · c copy · o issue · / search · i inbox · A agents · r refresh · q quit"
 		if m.cfg.GitHubSync {
 			keys += " · G github-pull"
 		}
