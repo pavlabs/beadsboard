@@ -63,7 +63,7 @@ func (r Reason) String() string {
 type Item struct {
 	Bead    string
 	Reason  Reason
-	Detail  string    // the agent's question, its error summary, or the PR title
+	Detail  string    // the agent's question, its error summary, or the PR title (fork-marked)
 	AgentID string    // agent this came from; "" for bead- and PR-level reasons
 	Ref     string    // "repo#number" for a pull request; "" otherwise
 	URL     string    // where to open it, for pull requests

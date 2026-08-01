@@ -214,9 +214,13 @@ func decodePulls(raw []byte) ([]PullRequest, error) {
 //
 // A fork's branch name is whatever the outside author typed and carries no
 // permission at all, so it is not trusted to name a bead — otherwise anyone
-// could push `bead/<id>` and have their PR listed as the work for it. A closing
-// reference survives the same test: it names an issue that has to exist, from
-// someone with access to reference it, and GitHub records it as a link.
+// could push `bead/<id>` and have their PR listed as the work for it.
+//
+// A closing reference is NOT held to a higher standard: GitHub populates it from
+// a "Closes <url>" line in the PR body, which any fork author writes themselves.
+// That vector is knowingly left open — the reference at least names an issue that
+// exists, and the inbox marks a fork PR with its author (see attention.pullDetail)
+// so a claimed bead is visibly claimed from outside. Do not read this as closed.
 func BeadFor(p PullRequest, graph *Graph) string {
 	if graph == nil {
 		return ""
