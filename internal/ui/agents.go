@@ -384,73 +384,92 @@ func (m model) dispatchPicker() (tea.Model, tea.Cmd) {
 // has its record but not its process or its log.
 const notManagedHere = "not run by this board — kill or resume it where it started"
 
-// tabRow is one line in the Agents tab. A row is either backed by this board's
-// own Manager — with a live status and a log tail — or known only from the shared
-// on-disk registry: an externally registered session, another board's agent, or
-// one of ours from before a restart. The registry is the reason the directory
-// exists, so the tab has to read it rather than only this process's memory.
-type tabRow struct {
+// agentRow is one agent as the board sees it, on both surfaces that list them —
+// the Agents tab and a bead's ledger. It is backed by this board's own Manager
+// (a live status and a log tail), known only from the shared on-disk registry
+// (an externally registered session, another board's agent, or one of ours from
+// before a restart), or both — a managed agent whose record supplies the mode
+// and source its view has no field for. The registry is the reason the directory
+// exists, so both surfaces have to read it rather than only this process's memory.
+type agentRow struct {
 	view  *agent.View      // nil for a registry-only row
-	rec   *agentreg.Record // nil for a manager-backed row
-	alive bool             // registry liveness; meaningful only for a registry row
+	rec   *agentreg.Record // nil when the registry does not know this agent
+	alive bool             // registry liveness; consulted only without a view
 }
 
-func (r tabRow) managed() bool { return r.view != nil }
+func (r agentRow) managed() bool { return r.view != nil }
 
-func (r tabRow) id() string {
+func (r agentRow) id() string {
 	if r.view != nil {
 		return r.view.ID
 	}
 	return r.rec.ID
 }
 
-func (r tabRow) bead() string {
+func (r agentRow) bead() string {
 	if r.view != nil {
 		return r.view.IssueID
 	}
 	return r.rec.BeadID
 }
 
-func (r tabRow) tool() agentreg.Tool {
-	if r.view != nil {
-		return r.view.Tool
+// tool, mode and source read the record first: it is the truth shared across
+// boards, and carries what a view cannot say about itself.
+func (r agentRow) tool() agentreg.Tool {
+	if r.rec != nil {
+		return r.rec.Tool
 	}
-	return r.rec.Tool
+	return r.view.Tool
+}
+
+func (r agentRow) mode() string {
+	if r.rec != nil {
+		return string(r.rec.Mode)
+	}
+	return "coding"
+}
+
+func (r agentRow) source() string {
+	if r.rec != nil {
+		return string(r.rec.Source)
+	}
+	return "local"
 }
 
 // active decides which half of the list a row sits in: a live process, or one
 // whose work is over (or whose owner is gone).
-func (r tabRow) active() bool {
+func (r agentRow) active() bool {
 	if r.view != nil {
 		return r.view.Status.Active()
 	}
 	return r.alive
 }
 
-// visibleAgents lists agents, active first, filtered to the hovered epic unless
-// show-all is on.
-func (m model) visibleAgents() []tabRow {
-	var rows []tabRow
-	managed := map[string]bool{}
-	for _, a := range m.mgr.Snapshot() {
-		managed[a.ID] = true
-		rows = append(rows, tabRow{view: &a})
+// statusWord labels the row: a managed row reports its process status, a
+// registry row only whether the process is still there.
+func (r agentRow) statusWord() string {
+	if r.view != nil {
+		return agentWord(r.view.Status)
 	}
-	// Registry records the Manager doesn't know: another board's agents, external
-	// sessions, and our own from before a restart.
-	for _, rec := range m.agentRecords {
-		if !managed[rec.ID] {
-			rows = append(rows, tabRow{rec: &rec, alive: m.agentAlive[rec.ID]})
-		}
+	if r.alive {
+		return "running"
+	}
+	return "ended"
+}
+
+// agentRows merges this board's live agents with the cached registry records,
+// deduped by ID (a record for a live agent enriches its row rather than adding a
+// second line), keeping the rows keep accepts, active first then stable.
+func (m model) agentRows(keep func(agentRow) bool) []agentRow {
+	recByID := make(map[string]*agentreg.Record, len(m.agentRecords))
+	for i := range m.agentRecords {
+		recByID[m.agentRecords[i].ID] = &m.agentRecords[i]
 	}
 
-	epic := m.currentEpic()
-	var active, recent []tabRow
-	for _, r := range rows {
-		bead := r.bead()
-		if !m.showAll && epic != "" && bead != epic &&
-			(m.graph == nil || m.graph.EpicOf(bead) != epic) {
-			continue
+	var active, recent []agentRow
+	add := func(r agentRow) {
+		if !keep(r) {
+			return
 		}
 		if r.active() {
 			active = append(active, r)
@@ -458,13 +477,42 @@ func (m model) visibleAgents() []tabRow {
 			recent = append(recent, r)
 		}
 	}
+	managed := map[string]bool{}
+	for _, v := range m.mgr.Snapshot() {
+		managed[v.ID] = true
+		add(agentRow{view: &v, rec: recByID[v.ID]})
+	}
+	// Registry records the Manager doesn't know: another board's agents, external
+	// sessions, and our own from before a restart.
+	for i := range m.agentRecords {
+		rec := &m.agentRecords[i]
+		if !managed[rec.ID] {
+			add(agentRow{rec: rec, alive: m.agentAlive[rec.ID]})
+		}
+	}
 	return append(active, recent...)
 }
 
-func (m model) selectedAgent() (tabRow, bool) {
+// visibleAgents lists agents for the Agents tab, filtered to the hovered epic
+// unless show-all is on.
+func (m model) visibleAgents() []agentRow {
+	epic := m.currentEpic()
+	return m.agentRows(func(r agentRow) bool {
+		bead := r.bead()
+		return m.showAll || epic == "" || bead == epic ||
+			(m.graph != nil && m.graph.EpicOf(bead) == epic)
+	})
+}
+
+// beadAgents lists the agents working one bead, for its detail-page ledger.
+func (m model) beadAgents(beadID string) []agentRow {
+	return m.agentRows(func(r agentRow) bool { return r.bead() == beadID })
+}
+
+func (m model) selectedAgent() (agentRow, bool) {
 	agents := m.visibleAgents()
 	if m.agentCursor < 0 || m.agentCursor >= len(agents) {
-		return tabRow{}, false
+		return agentRow{}, false
 	}
 	return agents[m.agentCursor], true
 }
@@ -499,10 +547,10 @@ func (m *model) killBeadAgent() {
 		return
 	}
 	row := rows[m.beadAgentCursor]
-	if row.internal {
-		m.mgr.Dismiss(row.id)
+	if row.managed() {
+		m.mgr.Dismiss(row.id())
 	} else if m.reg != nil {
-		_ = m.reg.Kill(row.id)
+		_ = m.reg.Kill(row.id())
 	}
 	m.clampBeadAgentCursor()
 }
@@ -655,7 +703,7 @@ func (m model) agentListContent(width, height int) string {
 	return b.String()
 }
 
-func (m model) renderAgentRow(r tabRow, selected bool, width int) string {
+func (m model) renderAgentRow(r agentRow, selected bool, width int) string {
 	if !r.managed() {
 		return m.renderRegistryRow(r, selected, width)
 	}
@@ -833,32 +881,19 @@ func (m model) regCmd() tea.Cmd {
 	}
 }
 
-// agentRow is one line of the per-bead ledger: an in-process headless agent, an
-// external registry record, or an internal agent enriched by its own record.
-type agentRow struct {
-	id         string
-	tool       string
-	mode       string
-	source     string
-	alive      bool
-	statusWord string
-	internal   bool       // backed by a live in-process agent (glyph/word from view)
-	view       agent.View // valid only when internal
-}
-
 // renderRegistryRow draws an agent this board only knows from the registry: its
 // bead, who runs it, and whether its process is still there. There is no status
 // or summary to show — those come from the Manager, which never saw it.
-func (m model) renderRegistryRow(r tabRow, selected bool, width int) string {
+func (m model) renderRegistryRow(r agentRow, selected bool, width int) string {
 	glyph, word := dimStyle.Render("○"), "gone"
 	if r.alive {
 		glyph, word = lipgloss.NewStyle().Foreground(cyan).Render("●"), "running"
 	}
-	detail := fmt.Sprintf("%s · %s · %s", word, r.rec.Tool, r.rec.Source)
-	prefix := fmt.Sprintf("%s %-7s %-4s ", glyph, shortID(r.rec.BeadID), string(r.rec.Mode))
+	detail := fmt.Sprintf("%s · %s · %s", word, r.tool(), r.source())
+	prefix := fmt.Sprintf("%s %-7s %-4s ", glyph, shortID(r.bead()), r.mode())
 	line := prefix + truncate(detail, max(width-lipgloss.Width(prefix), 4))
 	if selected {
-		plain := fmt.Sprintf("%s %-7s %-4s %s", markFor(r.alive), shortID(r.rec.BeadID), string(r.rec.Mode), detail)
+		plain := fmt.Sprintf("%s %-7s %-4s %s", markFor(r.alive), shortID(r.bead()), r.mode(), detail)
 		return selectedStyle.Width(width).Render(truncate(plain, width))
 	}
 	return line
@@ -874,7 +909,7 @@ func markFor(alive bool) string {
 // registryPreview describes an agent this board did not start. There is no log
 // to show — the tail lives in the process that runs it — so this reports where it
 // is running and how to reach it instead of pretending to be empty.
-func (m model) registryPreview(r tabRow, width int) string {
+func (m model) registryPreview(r agentRow, width int) string {
 	rec := r.rec
 	state := "process gone"
 	if r.alive {
@@ -898,63 +933,10 @@ func (m model) registryPreview(r tabRow, width int) string {
 	return b.String()
 }
 
-// beadAgents merges the live in-process agents working beadID with the cached
-// registry records for it, deduped by ID (a record matching an internal row
-// enriches that row rather than adding a second line), active/alive-first then
-// stable — mirroring visibleAgents' ordering.
-func (m model) beadAgents(beadID string) []agentRow {
-	recByID := make(map[string]agentreg.Record, len(m.agentRecords))
-	for _, rec := range m.agentRecords {
-		if rec.BeadID == beadID {
-			recByID[rec.ID] = rec
-		}
-	}
-
-	var active, recent []agentRow
-	add := func(r agentRow) {
-		if r.alive {
-			active = append(active, r)
-		} else {
-			recent = append(recent, r)
-		}
-	}
-	seen := map[string]bool{}
-	for _, v := range m.mgr.Snapshot() {
-		if v.IssueID != beadID {
-			continue
-		}
-		seen[v.ID] = true
-		row := agentRow{
-			id: v.ID, tool: "claude", mode: "coding", source: "local",
-			alive: v.Status.Active(), statusWord: agentWord(v.Status),
-			internal: true, view: v,
-		}
-		if rec, ok := recByID[v.ID]; ok {
-			row.tool, row.mode, row.source = string(rec.Tool), string(rec.Mode), string(rec.Source)
-		}
-		add(row)
-	}
-	for _, rec := range m.agentRecords {
-		if rec.BeadID != beadID || seen[rec.ID] {
-			continue
-		}
-		alive := m.agentAlive[rec.ID]
-		word := "ended"
-		if alive {
-			word = "running"
-		}
-		add(agentRow{
-			id: rec.ID, tool: string(rec.Tool), mode: string(rec.Mode),
-			source: string(rec.Source), alive: alive, statusWord: word,
-		})
-	}
-	return append(active, recent...)
-}
-
 // beadAgentMark is the uncoloured liveness rune, for use inside the selected-row
 // highlight (whose background an inner colour reset would otherwise break).
 func beadAgentMark(r agentRow) string {
-	if r.internal {
+	if r.managed() {
 		return agentGlyph(r.view.Status)
 	}
 	if r.alive {
@@ -963,12 +945,12 @@ func beadAgentMark(r agentRow) string {
 	return "·"
 }
 
-// beadAgentGlyph is the liveness marker: an internal row reuses the status glyph,
+// beadAgentGlyph is the liveness marker: a managed row reuses the status glyph,
 // an external one shows a live/idle dot from its cached liveness.
 func beadAgentGlyph(r agentRow) string {
 	mark := beadAgentMark(r)
 	switch {
-	case r.internal:
+	case r.managed():
 		return mark
 	case r.alive:
 		return lipgloss.NewStyle().Foreground(green).Render(mark)
@@ -993,8 +975,8 @@ func (m model) renderBeadAgents(rows []agentRow, width, height int) string {
 	}
 	focused := m.taskOpen && m.section == secAgents
 	for i, r := range rows {
-		id := shortID(r.id)
-		cols := fmt.Sprintf("%-7s %-8s %-9s %s", r.tool, r.mode, r.source, r.statusWord)
+		id := shortID(r.id())
+		cols := fmt.Sprintf("%-7s %-8s %-9s %s", r.tool(), r.mode(), r.source(), r.statusWord())
 		if focused && i == m.beadAgentCursor {
 			line := fmt.Sprintf("%s %-8s %s", beadAgentMark(r), id, cols)
 			b.WriteString("\n" + selectedStyle.Width(width).Render(truncate(line, width)))

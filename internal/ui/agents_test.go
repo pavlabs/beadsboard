@@ -276,9 +276,9 @@ func TestBeadAgentsExternal(t *testing.T) {
 			rows := m.beadAgents(tt.bead)
 			var gotIDs []string
 			for _, r := range rows {
-				gotIDs = append(gotIDs, r.id)
-				require.False(t, r.internal, "record-backed rows are external")
-				require.Equal(t, alive[r.id], r.alive)
+				gotIDs = append(gotIDs, r.id())
+				require.False(t, r.managed(), "record-backed rows are external")
+				require.Equal(t, alive[r.id()], r.active())
 			}
 			require.Equal(t, tt.wantIDs, gotIDs)
 		})
@@ -301,12 +301,12 @@ func TestBeadAgentsInternalAndDedupe(t *testing.T) {
 
 	rows := m.beadAgents(bead)
 	require.Len(t, rows, 1)
-	require.True(t, rows[0].internal)
-	require.Equal(t, view.ID, rows[0].id)
-	require.Equal(t, "claude", rows[0].tool)
-	require.Equal(t, "coding", rows[0].mode)
-	require.Equal(t, "local", rows[0].source)
-	require.True(t, rows[0].alive, "a running agent is alive")
+	require.True(t, rows[0].managed())
+	require.Equal(t, view.ID, rows[0].id())
+	require.Equal(t, agentreg.ToolClaude, rows[0].tool())
+	require.Equal(t, "coding", rows[0].mode())
+	require.Equal(t, "local", rows[0].source())
+	require.True(t, rows[0].active(), "a running agent is alive")
 
 	// Same-ID record: enriches tool/mode/source, does not add a second row, and
 	// its (stale) alive=false does not override the live view's liveness.
@@ -318,11 +318,11 @@ func TestBeadAgentsInternalAndDedupe(t *testing.T) {
 
 	rows = m.beadAgents(bead)
 	require.Len(t, rows, 1, "matching record enriches rather than duplicates")
-	require.True(t, rows[0].internal)
-	require.Equal(t, "codex", rows[0].tool)
-	require.Equal(t, "planning", rows[0].mode)
-	require.Equal(t, "external", rows[0].source)
-	require.True(t, rows[0].alive, "liveness comes from the live view, not the record map")
+	require.True(t, rows[0].managed())
+	require.Equal(t, agentreg.ToolCodex, rows[0].tool())
+	require.Equal(t, "planning", rows[0].mode())
+	require.Equal(t, "external", rows[0].source())
+	require.True(t, rows[0].active(), "liveness comes from the live view, not the record map")
 }
 
 // gitRepoUI makes a throwaway repo with one commit so an agent worktree can be
