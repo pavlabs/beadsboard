@@ -11,9 +11,10 @@ type Event struct {
 	Result   string
 }
 
-// Backend abstracts a coding-agent CLI (Claude Code, Codex, …): how to invoke it
-// headless, how to read its streamed output, and how to resume or seed an
-// interactive session. Its methods let the Manager stay tool-agnostic.
+// Backend abstracts an agent/model CLI: how to invoke it headless, read its
+// output, and resume or seed an interactive session. A backend that has no
+// resumable sessions returns nil from ResumeArgs; supported modes are enforced
+// by the launcher. Its methods let the Manager stay tool-agnostic.
 type Backend interface {
 	Bin() string                            // executable (path overridable in tests)
 	HeadlessArgs(spec Spec) []string        // args for a headless, streamed run
@@ -25,6 +26,7 @@ type Backend interface {
 var (
 	_ Backend = claudeBackend{}
 	_ Backend = codexBackend{}
+	_ Backend = ollamaBackend{}
 )
 
 // backendFor resolves the backend for tool, defaulting to claude for the empty

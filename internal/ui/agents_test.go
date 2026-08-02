@@ -155,6 +155,50 @@ func TestPickerChordPlanningClaude(t *testing.T) {
 	require.NotNil(t, cmd, "dispatch issues a planning command")
 }
 
+func TestPickerChordPlanningOllama(t *testing.T) {
+	m := testModel()
+	m.openPicker("a", "epic")
+	next, _ := m.handleKey(keyMsg("p"))
+	m = next.(model)
+	next, cmd := m.handleKey(keyMsg("m"))
+	m = next.(model)
+	require.False(t, m.pickerOpen)
+	require.Equal(t, tabDetails, m.tab)
+	require.NotNil(t, cmd, "planning with ollama opens a local session")
+}
+
+func TestPickerRejectsCodingOllama(t *testing.T) {
+	m := testModel()
+	m.openPicker("a", "epic")
+	next, cmd := m.handleKey(keyMsg("m"))
+	m = next.(model)
+	require.Equal(t, tabDetails, m.tab, "unsupported ollama coding does not switch to agents")
+	require.NotNil(t, cmd)
+	msg, ok := cmd().(interveneMsg)
+	require.True(t, ok)
+	require.ErrorContains(t, msg.err, "planning only")
+}
+
+func TestOllamaPlanningCommandUsesRunAndConfiguredModel(t *testing.T) {
+	t.Setenv("ZELLIJ", "")
+	t.Setenv("OLLAMA_MODEL", "gemma3:4b")
+	m := testModel()
+	msg, ok := m.planCmd("a", "epic", agentreg.ToolOllama)().(interveneMsg)
+	require.True(t, ok)
+	require.ErrorContains(t, msg.err, "ollama")
+	require.ErrorContains(t, msg.err, "run")
+	require.ErrorContains(t, msg.err, "gemma3:4b")
+}
+
+func TestPickerViewIncludesOllamaPlanningScope(t *testing.T) {
+	m := testModel()
+	m.openPicker("a", "epic")
+	view := m.pickerView(80, 20)
+	require.Contains(t, view, "ollama")
+	require.Contains(t, view, "planning only")
+	require.Contains(t, view, "unavailable")
+}
+
 // Arrow navigation moves both axes; enter dispatches the armed cell. Down moves
 // to the planning row and right to the codex column before enter fires.
 func TestPickerArrowNavAndEnter(t *testing.T) {
@@ -186,6 +230,26 @@ func TestBuildPlanningPrompt(t *testing.T) {
 	task := buildPlanningPrompt("bd-1", "task", "Add cache", "/root")
 	require.Contains(t, task, "bd-1")
 	require.Contains(t, task, "Add cache")
+}
+
+func TestPersistentPlanningPromptRecoversAndPersistsSummary(t *testing.T) {
+	prompt := buildPersistentPlanningPrompt("ep-1", "epic", "Platform", "/root", "Auth is the current priority.")
+	require.Contains(t, prompt, "persistent product manager")
+	require.Contains(t, prompt, "Auth is the current priority.")
+	require.Contains(t, prompt, "bd -C /root prime")
+	require.Contains(t, prompt, "beadsboard pm summarize")
+}
+
+func TestClaudePlanningResumesConfiguredPMSession(t *testing.T) {
+	t.Setenv("ZELLIJ", "")
+	m := testModel()
+	m.cfg.PMSession = "pm-session-7"
+	m.cfg.PMSummary = "Two epics confirmed."
+	msg, ok := m.planCmd("a", "epic", agentreg.ToolClaude)().(interveneMsg)
+	require.True(t, ok)
+	require.ErrorContains(t, msg.err, "--resume")
+	require.ErrorContains(t, msg.err, "pm-session-7")
+	require.ErrorContains(t, msg.err, "Two epics confirmed")
 }
 
 // A shows all agents in the Agents tab; with none spawned it shows the empty

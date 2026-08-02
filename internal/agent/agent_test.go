@@ -10,13 +10,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pavlabs/beadsboard/internal/beads"
 	"github.com/stretchr/testify/require"
 )
 
 // fakeCommenter records the bead-activity comments a Manager posts.
 type fakeCommenter struct {
-	mu    sync.Mutex
-	posts []string // "<beadID> <body>"
+	mu        sync.Mutex
+	posts     []string // "<beadID> <body>"
+	pulls     []beads.PullRequest
+	pullCalls [][]string
 }
 
 func (f *fakeCommenter) Comment(_ context.Context, id, body string) error {
@@ -24,6 +27,13 @@ func (f *fakeCommenter) Comment(_ context.Context, id, body string) error {
 	defer f.mu.Unlock()
 	f.posts = append(f.posts, id+" "+body)
 	return nil
+}
+
+func (f *fakeCommenter) PullRequests(_ context.Context, repos []string) ([]beads.PullRequest, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pullCalls = append(f.pullCalls, append([]string(nil), repos...))
+	return append([]beads.PullRequest(nil), f.pulls...), nil
 }
 
 func (f *fakeCommenter) all() []string {
@@ -137,6 +147,50 @@ func TestSpawnPostsLifecycleComments(t *testing.T) {
 	require.Contains(t, joined, "epic-x bb-agent spawn agent=epic-x-1 tool=claude mode=coding branch=beadsboard/epic-x-1")
 	require.Contains(t, joined, "epic-x bb-agent session agent=epic-x-1 session=sess-123")
 	require.Contains(t, joined, "epic-x bb-agent finish agent=epic-x-1 status=done result=All done.")
+}
+
+func TestDetectArtifactsFindsCommittedBranchAndMatchingPR(t *testing.T) {
+	repo := gitRepo(t)
+	base, err := gitOutput(repo, "rev-parse", "HEAD")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "work.txt"), []byte("landed\n"), 0o644))
+	for _, args := range [][]string{{"add", "work.txt"}, {"commit", "-q", "-m", "work"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		require.NoError(t, cmd.Run())
+	}
+
+	fc := &fakeCommenter{pulls: []beads.PullRequest{
+		{Repo: "acme/app", Branch: "somewhere-else", URL: "https://github.com/acme/app/pull/1"},
+		{Repo: "acme/app", Branch: "beadsboard/task-1", URL: "https://github.com/acme/app/pull/2"},
+	}}
+	m := New(repo, "claude", 1)
+	m.SetCommenter(fc)
+	branch, pr := m.detectArtifacts(repo, base, "beadsboard/task-1", "acme/app")
+
+	require.Equal(t, "beadsboard/task-1", branch)
+	require.Equal(t, "https://github.com/acme/app/pull/2", pr)
+	require.Equal(t, [][]string{{"acme/app"}}, fc.pullCalls)
+	comment := finishComment("task-1-1", Done, branch, pr, "Done.")
+	require.Contains(t, comment, "branch=beadsboard/task-1")
+	require.Contains(t, comment, "pr=https://github.com/acme/app/pull/2")
+}
+
+func TestDetectArtifactsDoesNotPostEmptyBranchOrQueryPRs(t *testing.T) {
+	repo := gitRepo(t)
+	base, err := gitOutput(repo, "rev-parse", "HEAD")
+	require.NoError(t, err)
+	fc := &fakeCommenter{pulls: []beads.PullRequest{{
+		Repo: "acme/app", Branch: "beadsboard/task-1", URL: "https://github.com/acme/app/pull/2",
+	}}}
+	m := New(repo, "claude", 1)
+	m.SetCommenter(fc)
+
+	branch, pr := m.detectArtifacts(repo, base, "beadsboard/task-1", "acme/app")
+	require.Empty(t, branch)
+	require.Empty(t, pr)
+	require.Empty(t, fc.pullCalls)
+	require.NotContains(t, finishComment("task-1-1", Failed, branch, pr, "failed"), "branch=")
 }
 
 // A run that ends with the marker becomes NeedsInput, keeps its question, and

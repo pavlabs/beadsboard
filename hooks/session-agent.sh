@@ -33,6 +33,7 @@ SessionStart)
 	# reliable cleanup, liveness only a fallback.
 	beadsboard agent register \
 		--id "$sid" --bead "$bead" --mode coding --source external \
-		--tool claude --session "$sid" --cwd "$cwd" --pid "$PPID" 2>/dev/null || true
+		--tool claude --session "$sid" --cwd "$cwd" --pid "$PPID" \
+		--pane "${ZELLIJ_PANE_ID:-}" 2>/dev/null || true
 	;;
 esac

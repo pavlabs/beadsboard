@@ -16,6 +16,7 @@ import (
 	"github.com/pavlabs/beadsboard/internal/agentreg"
 	"github.com/pavlabs/beadsboard/internal/beads"
 	"github.com/pavlabs/beadsboard/internal/config"
+	"github.com/pavlabs/beadsboard/internal/dispatch"
 )
 
 // --- agent spawning & intervention --------------------------------------------
@@ -59,6 +60,29 @@ func (m model) spawnCmd(issueID, scope string, tool agentreg.Tool) tea.Cmd {
 			err = syncErr // surface a best-effort sync failure only if the spawn itself succeeded
 		}
 		return spawnedMsg{err: err}
+	}
+}
+
+// startDispatch arms an epic-subtree campaign. Every subsequent agent event or
+// adopted bead revision re-evaluates readiness until the campaign drains.
+func (m *model) startDispatch(ids []string, tool agentreg.Tool) {
+	if m.dispatchRun == nil {
+		m.dispatchRun = dispatch.NewCampaign(dispatch.New(m.client, m.reg))
+	}
+	m.dispatchRun.Start(ids)
+	m.dispatchTool = tool
+}
+
+func (m model) dispatchRefreshCmd() tea.Cmd {
+	if m.dispatchRun == nil || !m.dispatchRun.NeedsEvaluation() {
+		return nil
+	}
+	run, maxAgents := m.dispatchRun, m.cfg.MaxAgents
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		issues, err := run.Reevaluate(ctx, maxAgents)
+		return dispatchReadyMsg{issues: issues, err: err}
 	}
 }
 
@@ -146,6 +170,11 @@ func buildPlanningPrompt(id, scope, title, beadsRoot string) string {
 	return sb.String()
 }
 
+func buildPersistentPlanningPrompt(id, scope, title, beadsRoot, summary string) string {
+	prompt := buildPlanningPrompt(id, scope, title, beadsRoot)
+	return fmt.Sprintf("You are the project's persistent product manager. Recovery summary: %s\n\n%s\n\nBefore ending, persist a compact recovery summary with `beadsboard pm summarize --root %s --summary <text>`.", summary, prompt, beadsRoot)
+}
+
 // interveneCmd opens an interactive resume of the agent's session in a floating
 // zellij pane, using the agent's own backend to build the resume command.
 // Requires running inside a zellij session.
@@ -167,6 +196,25 @@ func interveneCmd(cwd, session string, b agent.Backend) tea.Cmd {
 		}
 		args := append([]string{"run", "--floating", "--close-on-exit", "--name", name, "--cwd", cwd, "--"}, resume...)
 		cmd := exec.Command("zellij", args...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return interveneMsg{err: fmt.Errorf("zellij: %w: %s", err, strings.TrimSpace(string(out)))}
+		}
+		return interveneMsg{}
+	}
+}
+
+// reattachCmd gives control back to an already-running interactive agent pane.
+// Resuming the same session while it is live would create a competing process,
+// so live registry records always focus their original pane instead.
+func reattachCmd(paneID string) tea.Cmd {
+	return func() tea.Msg {
+		if os.Getenv("ZELLIJ") == "" {
+			return interveneMsg{err: fmt.Errorf("not in zellij — reattach pane %s manually", paneID)}
+		}
+		if paneID == "" {
+			return interveneMsg{err: fmt.Errorf("live session has no zellij pane id")}
+		}
+		cmd := exec.Command("zellij", "action", "focus-pane-id", paneID)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return interveneMsg{err: fmt.Errorf("zellij: %w: %s", err, strings.TrimSpace(string(out)))}
 		}
@@ -225,9 +273,20 @@ func (m model) planCmd(target, scope string, tool agentreg.Tool) tea.Cmd {
 	}
 	beadsRoot := m.client.Dir
 	b := m.mgr.Backend(tool)
-	prompt := buildPlanningPrompt(target, scope, title, beadsRoot)
+	prompt := buildPersistentPlanningPrompt(target, scope, title, beadsRoot, m.cfg.PMSummary)
 	return func() tea.Msg {
-		session := shQuote(b.Bin()) + " " + shQuote(prompt)
+		var backendArgs []string
+		if tool == agentreg.ToolClaude && m.cfg.PMSession != "" {
+			backendArgs = append(b.ResumeArgs(m.cfg.PMSession), prompt)
+		} else {
+			backendArgs = b.InteractiveArgs(prompt)
+		}
+		argv := append([]string{b.Bin()}, backendArgs...)
+		quoted := make([]string, len(argv))
+		for i, arg := range argv {
+			quoted[i] = shQuote(arg)
+		}
+		session := strings.Join(quoted, " ")
 		if os.Getenv("ZELLIJ") == "" {
 			return interveneMsg{err: fmt.Errorf("not in zellij — plan manually: cd %s && %s", beadsRoot, session)}
 		}
@@ -235,7 +294,7 @@ func (m model) planCmd(target, scope string, tool agentreg.Tool) tea.Cmd {
 		// Bracket the interactive session with register/unregister so the ledger
 		// tracks it; $PWD is the pane's cwd (beadsRoot) and $$ its pid, for liveness.
 		script := fmt.Sprintf(
-			"beadsboard agent register --id %s --bead %s --mode planning --source beadsboard --tool %s --cwd \"$PWD\" --pid $$; %s; beadsboard agent unregister --id %s",
+			"beadsboard agent register --id %s --bead %s --mode planning --source beadsboard --tool %s --cwd \"$PWD\" --pid $$ --pane \"${ZELLIJ_PANE_ID:-}\"; %s; beadsboard agent unregister --id %s",
 			shQuote(id), shQuote(target), shQuote(string(tool)), session, shQuote(id),
 		)
 		name := "plan " + target
@@ -299,8 +358,12 @@ func (m model) handleAgentsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "k":
 		if r, ok := m.selectedAgent(); ok {
 			if !r.managed() {
-				m.notice = notManagedHere
-				return m, nil
+				if m.reg != nil {
+					if err := m.reg.Kill(r.id()); err != nil {
+						m.notice = "can't kill " + shortID(r.bead()) + ": " + err.Error()
+					}
+				}
+				return m, m.regCmd()
 			}
 			if r.view.Status == agent.Running {
 				m.mgr.Kill(r.id())
@@ -318,8 +381,14 @@ func (m model) handleAgentsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		if r, ok := m.selectedAgent(); ok {
 			if !r.managed() {
-				m.notice = notManagedHere
-				return m, nil
+				if r.active() {
+					return m, reattachCmd(r.rec.PaneID)
+				}
+				if r.rec.SessionID == "" || r.rec.Cwd == "" {
+					m.notice = "can't resume " + shortID(r.bead()) + ": no session or working directory recorded"
+					return m, nil
+				}
+				return m, interveneCmd(r.rec.Cwd, r.rec.SessionID, m.mgr.Backend(r.tool()))
 			}
 			cwd, sess, err := m.mgr.Intervene(r.id())
 			if err != nil {
@@ -334,9 +403,9 @@ func (m model) handleAgentsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 // --- launcher matrix ----------------------------------------------------------
 
-// handlePickerKey drives the launcher matrix (coding/planning × claude/codex).
-// The mode letters c/p only move the row; the backend letters l/o pick the column
-// AND dispatch, so a blind chord `a c l` / `a p o` completes on the tool letter.
+// handlePickerKey drives the launcher matrix (coding/planning × backend).
+// The mode letters c/p only move the row; l/o/m pick a backend and dispatch, so
+// a blind chord such as `a p m` completes on the tool letter.
 // Horizontal nav is arrows-only — h/l would collide with the claude chord.
 func (m model) handlePickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
@@ -347,17 +416,30 @@ func (m model) handlePickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "c":
 		m.pickerMode = pickCoding
 	case "p":
-		m.pickerMode = pickPlanning
+		if m.pickerScope != "subtree" {
+			m.pickerMode = pickPlanning
+		}
 	case "l":
 		m.pickerBackend = pickClaude
 		return m.dispatchPicker()
 	case "o":
 		m.pickerBackend = pickCodex
 		return m.dispatchPicker()
+	case "m":
+		if m.pickerScope != "subtree" {
+			m.pickerBackend = pickOllama
+			return m.dispatchPicker()
+		}
 	case "up", "down", "j", "k":
-		m.pickerMode = (m.pickerMode + 1) % 2 // two rows: toggle
+		if m.pickerScope != "subtree" {
+			m.pickerMode = (m.pickerMode + 1) % 2
+		}
 	case "left", "right":
-		m.pickerBackend = (m.pickerBackend + 1) % 2 // two columns: toggle
+		tools := len(pickerTools)
+		if m.pickerScope == "subtree" {
+			tools--
+		}
+		m.pickerBackend = (m.pickerBackend + 1) % tools
 	case "enter":
 		return m.dispatchPicker()
 	}
@@ -372,6 +454,26 @@ func (m model) dispatchPicker() (tea.Model, tea.Cmd) {
 	tool := pickerTools[m.pickerBackend]
 	planning := m.pickerMode == pickPlanning
 	m.pickerOpen = false
+	if scope == "subtree" {
+		var ids []string
+		for _, id := range m.graph.Tasks[target] {
+			if m.graph.Issues[id].Status != "closed" {
+				ids = append(ids, id)
+			}
+		}
+		if len(ids) == 0 {
+			m.notice = "no open tasks to auto-run"
+			return m, nil
+		}
+		m.startDispatch(ids, tool)
+		m.notice = fmt.Sprintf("auto-running %d task(s) with %s", len(ids), tool)
+		return m, m.dispatchRefreshCmd()
+	}
+	if tool == agentreg.ToolOllama && !planning {
+		return m, func() tea.Msg {
+			return interveneMsg{err: fmt.Errorf("ollama supports planning only; choose the planning row")}
+		}
+	}
 	if planning {
 		return m, m.planCmd(target, scope, tool)
 	}
@@ -783,17 +885,28 @@ func (m model) settingsView(width, height int) string {
 	return b.String()
 }
 
-// pickerView draws the launcher matrix — coding/planning rows × claude/codex
+// pickerView draws the launcher matrix — coding/planning rows × backend
 // columns — highlighting the armed cell and labelling each with its blind chord.
 func (m model) pickerView(width, height int) string {
 	modes := []struct{ label, key string }{{"coding", "c"}, {"planning", "p"}}
-	tools := []struct{ label, key string }{{"claude", "l"}, {"codex", "o"}}
+	tools := []struct{ label, key string }{{"claude", "l"}, {"codex", "o"}, {"ollama", "m"}}
+	if m.pickerScope == "subtree" {
+		modes = modes[:1]
+		tools = tools[:2]
+	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s\n\n", dimStyle.Render("LAUNCH "+shortID(m.pickerTarget)+" ("+m.pickerScope+")"))
+	heading := "LAUNCH " + shortID(m.pickerTarget) + " (" + m.pickerScope + ")"
+	if m.pickerScope == "subtree" {
+		heading = fmt.Sprintf("AUTO-RUN %s (%d open tasks)", shortID(m.pickerTarget), m.openTaskCount(m.pickerTarget))
+	}
+	fmt.Fprintf(&b, "%s\n\n", dimStyle.Render(heading))
 	for mi, mo := range modes {
 		for ti, to := range tools {
 			line := fmt.Sprintf("%-9s %-7s a %s %s", mo.label, to.label, mo.key, to.key)
+			if mi == pickCoding && ti == pickOllama {
+				line += "  unavailable"
+			}
 			if mi == m.pickerMode && ti == m.pickerBackend {
 				b.WriteString(selectedStyle.Render(" " + line + " "))
 			} else {
@@ -802,8 +915,22 @@ func (m model) pickerView(width, height int) string {
 			b.WriteByte('\n')
 		}
 	}
-	b.WriteString("\n" + dimStyle.Render("coding spawns a headless agent · planning opens a local session"))
+	legend := "coding spawns a headless agent; planning opens a local session; ollama is planning only"
+	if m.pickerScope == "subtree" {
+		legend = "ready tasks start up to max agents; blocked tasks queue until their dependencies close"
+	}
+	b.WriteString("\n" + dimStyle.Render(legend))
 	return b.String()
+}
+
+func (m model) openTaskCount(epic string) int {
+	n := 0
+	for _, id := range m.graph.Tasks[epic] {
+		if m.graph.Issues[id].Status != "closed" {
+			n++
+		}
+	}
+	return n
 }
 
 // tildePath abbreviates the user's home directory to ~ for display.

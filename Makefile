@@ -5,7 +5,7 @@ SOURCE  ?= .
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build run test test-race vet lint fmt check install tidy clean
+.PHONY: help build run test test-pty test-race vet lint fmt check install tidy clean
 
 help: ## List available targets
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sort | \
@@ -19,6 +19,9 @@ run: ## Run against SOURCE (e.g. make run SOURCE=~/code/projects/bilder)
 
 test: ## Run the tests
 	go test ./...
+
+test-pty: build ## Smoke-test agent controls in a real pseudo-terminal (requires pyte)
+	python3 tests/pty_smoke.py ./$(BINARY)
 
 test-race: ## Run the tests with the race detector
 	go test -race ./...

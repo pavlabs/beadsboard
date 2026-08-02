@@ -18,7 +18,7 @@ func registryModel() model {
 	m.agentRecords = []agentreg.Record{{
 		ID: "ext-1", BeadID: "a.2", Tool: agentreg.ToolClaude, Mode: agentreg.ModeCoding,
 		Source: agentreg.SourceExternal, PID: os.Getpid(), Branch: "bead/a.2",
-		SessionID: "sess-ext", Cwd: "/tmp/somewhere",
+		SessionID: "sess-ext", Cwd: "/tmp/somewhere", PaneID: "terminal_7",
 	}}
 	m.agentAlive = map[string]bool{"ext-1": true}
 	return m
@@ -68,10 +68,10 @@ func TestRegistryPreviewExplainsItself(t *testing.T) {
 	require.Contains(t, out, "not run by this board")
 }
 
-// Kill, dismiss and resume need the in-process Manager. On someone else's agent
-// they say so rather than silently doing nothing.
+// Dismiss needs the in-process Manager. On someone else's agent it says so
+// rather than silently doing nothing.
 func TestRegistryAgentActionsExplainRatherThanNoOp(t *testing.T) {
-	for _, key := range []string{"k", "x", "enter"} {
+	for _, key := range []string{"x"} {
 		m := registryModel()
 		next, cmd := m.handleAgentsKey(keyMsg(key))
 		m = next.(model)
@@ -81,7 +81,64 @@ func TestRegistryAgentActionsExplainRatherThanNoOp(t *testing.T) {
 	}
 }
 
+// k on a registry-only row uses the shared registry control path and removes
+// the record, matching the task-detail ledger's external kill behavior.
+func TestRegistryAgentKill(t *testing.T) {
+	m := registryModel()
+	dir := t.TempDir()
+	m.reg = agentreg.New(dir)
+	rec := *m.visibleAgents()[0].rec
+	rec.PID = 0 // no process signal in this focused routing test
+	require.NoError(t, m.reg.Put(rec))
+
+	_, cmd := m.handleAgentsKey(keyMsg("k"))
+	require.NotNil(t, cmd, "registry refresh follows the kill")
+	got, err := m.reg.List()
+	require.NoError(t, err)
+	require.Empty(t, got)
+}
+
+// Enter on a live external session reattaches its existing pane. It must not
+// start a second process by resuming the same session concurrently.
+func TestRegistryAgentEnterReattachesLivePane(t *testing.T) {
+	t.Setenv("ZELLIJ", "")
+	m := registryModel()
+	next, cmd := m.handleAgentsKey(keyMsg("enter"))
+	m = next.(model)
+	require.NotNil(t, cmd)
+	require.Empty(t, m.notice)
+
+	msg := cmd().(interveneMsg)
+	require.ErrorContains(t, msg.err, "reattach pane terminal_7")
+	require.NotContains(t, msg.err.Error(), "--resume")
+}
+
+// An ended registry session is no longer attachable, so Enter falls back to
+// the backend's resumable-session command using the recorded cwd/session id.
+func TestRegistryAgentEnterResumesInactiveSession(t *testing.T) {
+	t.Setenv("ZELLIJ", "")
+	m := registryModel()
+	m.agentAlive["ext-1"] = false
+	next, cmd := m.handleAgentsKey(keyMsg("enter"))
+	_ = next.(model)
+	require.NotNil(t, cmd)
+
+	msg := cmd().(interveneMsg)
+	require.ErrorContains(t, msg.err, "cd /tmp/somewhere")
+	require.ErrorContains(t, msg.err, "sess-ext")
+}
+
 // The board footer advertises the tab; without it, A is undiscoverable.
 func TestBoardFooterAdvertisesAgentsTab(t *testing.T) {
 	require.Contains(t, testModel().footerLine(), "A agents")
+}
+
+// Once in the Agents tab, every control affordance is discoverable in-place.
+func TestAgentsFooterAdvertisesControls(t *testing.T) {
+	m := registryModel()
+	f := m.footerLine()
+	require.Contains(t, f, "↑/↓ select")
+	require.Contains(t, f, "enter intervene/reattach")
+	require.Contains(t, f, "k kill")
+	require.Contains(t, f, "A all")
 }
