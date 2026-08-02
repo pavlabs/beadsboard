@@ -25,6 +25,9 @@ type Config struct {
 
 	GitHubSync       bool   `toml:"github_sync"`       // push task status changes via `bd github sync`
 	GitHubRepository string `toml:"github_repository"` // "owner/repo"; empty = use bd's own github config
+	ProjectLayout    string `toml:"project_layout"`    // "single" | "meta"
+	PMSession        string `toml:"pm_session"`        // stable Claude session id for the project manager
+	PMSummary        string `toml:"pm_summary"`        // compact recovery context prepended on resume
 
 	// Projects v2 board for reverse status sync (G reads the Status column so a
 	// card move flows back into bd). Number 0 = board sync off; G then falls back
@@ -52,6 +55,7 @@ func Default() Config {
 		},
 		GitHubSync:          false,
 		GitHubRepository:    "",
+		ProjectLayout:       "single",
 		GitHubProjectOwner:  "",
 		GitHubProjectNumber: 0,
 	}

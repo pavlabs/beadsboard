@@ -63,7 +63,7 @@ func (r Reason) String() string {
 type Item struct {
 	Bead    string
 	Reason  Reason
-	Detail  string    // the agent's question, its error summary, or the PR title
+	Detail  string    // the agent's question, its error summary, or the PR title (fork-marked)
 	AgentID string    // agent this came from; "" for bead- and PR-level reasons
 	Ref     string    // "repo#number" for a pull request; "" otherwise
 	URL     string    // where to open it, for pull requests
@@ -159,7 +159,7 @@ func fromRecord(rec agentreg.Record, alive bool, graph *beads.Graph) (Item, bool
 func fromPull(p beads.PullRequest, graph *beads.Graph, now time.Time) (Item, bool) {
 	it := Item{
 		Bead:   beads.BeadFor(p, graph),
-		Detail: p.Title,
+		Detail: pullDetail(p),
 		Ref:    p.Ref(),
 		URL:    p.URL,
 		At:     p.Updated,
@@ -188,6 +188,22 @@ func fromPull(p beads.PullRequest, graph *beads.Graph, now time.Time) (Item, boo
 		it.Reason = ReviewRequired
 	}
 	return it, true
+}
+
+// pullDetail is the PR title, marked with its author when the PR comes from a
+// fork. Title and branch are both whatever an outside author typed, so without
+// the mark such a row reads exactly like the team's own work — and it is the
+// same untrustworthiness that keeps its branch from naming a bead (see
+// beads.BeadFor).
+func pullDetail(p beads.PullRequest) string {
+	if !p.Fork {
+		return p.Title
+	}
+	from := "fork"
+	if p.Author != "" {
+		from = "fork @" + p.Author
+	}
+	return "[" + from + "] " + p.Title
 }
 
 // fromGraph surfaces beads the tracker itself flags as blocked, which is the one

@@ -25,10 +25,13 @@ beadsboard --version
   no `$EDITOR` handoff.
 - **Fuzzy search** with `/`, scoped to whichever list is in view (epics or an epic's
   tasks). **`w`** wraps long epic titles.
-- **Headless agents.** `a` spawns an autonomous `claude` in an isolated git worktree
-  to work the task or epic and open a PR. The **Agents** tab shows each agent's live
+- **Agent launcher.** `a` opens a backend matrix: Claude and Codex can run autonomous
+  coding agents in isolated git worktrees or planning sessions; Ollama supports
+  planning sessions only because its plain CLI has no tool loop. The **Agents** tab shows each agent's live
   status; an agent that gets stuck stops and asks. `enter` resumes one in a floating
-  zellij pane to intervene; `k` kills, `x` dismisses. `S` opens settings.
+  zellij pane to intervene; `k` kills, `x` dismisses. `D` auto-runs the selected
+  epic's open tasks in dependency order, filling available agent slots and queuing
+  blocked tasks until their prerequisites close. `S` opens settings.
 - **Attention inbox.** `i` answers one question board-wide: what is waiting on you?
   Agents that stopped to ask, agents that errored, registered agents whose process
   died mid-task, blocked beads, and open pull requests that need a human — one list,
@@ -129,6 +132,31 @@ Settings live in `~/.beadsboard/config.toml`, overridden per-repo by a local
 the in-app settings panel (`S`) writes the same file. Keys: `max_agents`, `max_turns`,
 `permission_mode`, `recent_ttl_secs`, a `[tools]` allow-map, and the `github_sync` /
 `github_repository` / `github_project_*` sync options.
+
+Ollama planning uses `ollama run` with `qwen3:8b` by default. Set `OLLAMA_MODEL`
+to any locally installed model name to override it. Ollama is intentionally not
+offered for coding: the plain CLI cannot edit files, run checks, or open a PR.
+
+## First-run setup
+
+Run `beadsboard init --source PATH`. Before changing the directory, the command
+identifies it as empty or existing-but-unplanned and asks for confirmation. The
+wizard initializes Git and Beads, explains and records a `single` or `meta`
+repository layout, writes the local configuration, and opens a persistent Claude
+project-manager interview in Zellij. The PM proposes a lean epic set and must wait
+for explicit confirmation before creating beads; after it launches, beadsboard
+opens the freshly planned board.
+
+For automation, use `--yes --layout single|meta`, optionally with
+`--github-repo owner/repo`; `--no-tui` skips only the final board. A single-repo
+GitHub value enables sync. Meta repositories leave root sync disabled because
+individual beads route to their labelled sub-repositories.
+
+The local config stores `pm_session` and `pm_summary`. Every later Claude planning
+launch resumes that PM session, runs `bd prime` for authoritative context, and
+updates the compact summary through `beadsboard pm summarize` rather than editing
+TOML directly. Plain Ollama and Codex planning sessions receive the same recovery
+prompt but cannot resume the Claude session.
 
 ## Development
 

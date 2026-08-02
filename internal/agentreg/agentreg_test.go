@@ -46,12 +46,14 @@ func TestPutOverwrites(t *testing.T) {
 
 	updated := rec("a-1", "bead-x", 111, time.Now())
 	updated.SessionID = "sess-9"
+	updated.PaneID = "terminal_9"
 	require.NoError(t, r.Put(updated))
 
 	all, err := r.List()
 	require.NoError(t, err)
 	require.Len(t, all, 1)
 	require.Equal(t, "sess-9", all[0].SessionID)
+	require.Equal(t, "terminal_9", all[0].PaneID)
 }
 
 // A fresh registry touches no disk: List is empty and the dir is not created.

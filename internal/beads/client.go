@@ -177,6 +177,25 @@ func (c *Client) Update(ctx context.Context, id, field, value string) error {
 	return nil
 }
 
+// Create adds a manually-authored issue. A non-empty parent creates a child
+// task under that epic; argv is passed directly so titles need no shell escaping.
+func (c *Client) Create(ctx context.Context, title, issueType, parent string) error {
+	cmd := exec.CommandContext(ctx, "bd", createArgs(title, issueType, parent)...)
+	cmd.Dir = c.Dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("bd create: %w: %s", err, sanitize(strings.TrimSpace(string(out))))
+	}
+	return nil
+}
+
+func createArgs(title, issueType, parent string) []string {
+	args := []string{"create", "--title", title, "--type", issueType}
+	if parent != "" {
+		args = append(args, "--parent", parent)
+	}
+	return args
+}
+
 // Delete removes an issue via `bd delete --force`, cascading to its dependents
 // when cascade is set — required to delete an epic together with its child tasks
 // (bd otherwise refuses rather than orphan them).

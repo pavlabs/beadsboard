@@ -107,6 +107,15 @@ func (m model) headerLine() string {
 }
 
 func (m model) footerLine() string {
+	if m.creating {
+		kind := m.createType
+		line := "  " + dimStyle.Render("new "+kind+" title ") + m.input.View() +
+			dimStyle.Render("  · enter create · esc cancel")
+		if m.notice != "" {
+			line += warnStyle.Render("  ⚠ " + m.notice)
+		}
+		return line
+	}
 	if m.pendingDelete != "" {
 		id := m.pendingDelete
 		warn := "delete " + id + "?"
@@ -118,7 +127,10 @@ func (m model) footerLine() string {
 		return "  " + lipgloss.NewStyle().Foreground(yellow).Render(warn+"  y confirm · any other key cancel")
 	}
 	if m.pickerOpen {
-		return dimStyle.Render("  c coding · p planning · then l claude · o codex · ↑↓←→ move · enter launch · esc cancel")
+		if m.pickerScope == "subtree" {
+			return dimStyle.Render("  l claude | o codex | ←/→ choose | enter auto-run | esc cancel")
+		}
+		return dimStyle.Render("  c coding | p planning | then l claude, o codex, m ollama | ↑↓←→ move | enter launch | esc cancel")
 	}
 	if m.settingsOpen {
 		return dimStyle.Render("  ↑/↓ field · ←/→ change · s save · esc cancel")
@@ -133,7 +145,7 @@ func (m model) footerLine() string {
 	var keys string
 	switch {
 	case m.tab == tabAgents:
-		keys = "↑/↓ select · enter intervene · k kill · x dismiss · w wrap · A all · S settings · m back"
+		keys = "↑/↓ select · enter intervene/reattach · k kill · x dismiss · w wrap · A all · S settings · m back"
 	case m.editing:
 		switch m.editSec {
 		case secStatus, secPriority:
@@ -146,13 +158,13 @@ func (m model) footerLine() string {
 	case m.taskOpen && m.section == secAgents:
 		keys = "↑/↓ select · x kill · tab field · esc back · q quit"
 	case m.taskOpen:
-		keys = "tab field · e edit · ↑/↓ scroll · esc back · q quit"
+		keys = "tab field · e edit · c copy · o issue · ↑/↓ scroll · esc back · q quit"
 	case m.focused && m.section == secTasks:
-		keys = "↑/↓ task · enter open · / search · tab section · esc back"
+		keys = "↑/↓ task · enter open · D auto-run · n new · c copy · o issue · / search · tab section · esc back"
 	case m.focused:
-		keys = "tab section · e edit · ↑/↓ scroll · esc back · q quit"
+		keys = "tab section · D auto-run · t tasks · e edit · c copy · o issue · esc back · q quit"
 	default:
-		keys = "↑/↓ move · → open · / search · w wrap · i inbox · A agents · r refresh · q quit"
+		keys = "↑/↓ move · → open · D auto-run · n new · t tasks · c copy · o issue · / search · i inbox · A agents · r refresh · q quit"
 		if m.cfg.GitHubSync {
 			keys += " · G github-pull"
 		}
@@ -363,11 +375,15 @@ func (m model) renderRow(id string, selected bool, width int) string {
 		}
 	} else {
 		status = m.graph.TaskStatus[id]
-		switch status {
-		case beads.StatusReady:
-			annotation = "◀ start"
-		case beads.StatusBlocked:
-			annotation = "waits " + joinLimit(m.blockerRefs(id), 3)
+		if state := m.taskDispatchState(id, status); state != "" {
+			annotation = state
+		} else {
+			switch status {
+			case beads.StatusReady:
+				annotation = "◀ start"
+			case beads.StatusBlocked:
+				annotation = "waits " + joinLimit(m.blockerRefs(id), 3)
+			}
 		}
 	}
 
@@ -398,6 +414,24 @@ func (m model) renderRow(id string, selected bool, width int) string {
 		return selectedStyle.Width(width).Render(truncate(plain, width))
 	}
 	return line
+}
+
+func (m model) taskDispatchState(id, status string) string {
+	for _, row := range m.beadAgents(id) {
+		if row.active() {
+			return "running"
+		}
+	}
+	if m.dispatchRun == nil || !m.dispatchRun.Pending()[id] {
+		return ""
+	}
+	if status == beads.StatusBlocked {
+		if refs := m.blockerRefs(id); len(refs) > 0 {
+			return "blocked: waits " + joinLimit(refs, 3)
+		}
+		return "blocked"
+	}
+	return "queued"
 }
 
 // syncDetail refreshes the fields region for the highlighted epic and resets

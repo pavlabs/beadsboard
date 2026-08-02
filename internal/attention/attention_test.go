@@ -216,3 +216,20 @@ func TestPullCarriesBeadWhenResolvable(t *testing.T) {
 	require.Empty(t, got[1].Bead)
 	require.Equal(t, "w#2", got[1].Ref)
 }
+
+// A PR from a fork is labelled with who sent it, because its title and branch
+// are an outsider's text and the row would otherwise read as the team's own work.
+func TestForkPullIsMarkedWithItsAuthor(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	pulls := []beads.PullRequest{
+		{Repo: "acme/w", Number: 1, Title: "fix: typo", Author: "drive-by", Fork: true, Updated: now},
+		{Repo: "acme/w", Number: 2, Title: "fix: typo", Fork: true, Updated: now},
+		{Repo: "acme/w", Number: 3, Title: "fix: typo", Author: "artemijspavlovs", Updated: now},
+	}
+
+	got := Collect(nil, nil, nil, pulls, graphWith(nil), now)
+
+	require.Equal(t, "[fork @drive-by] fix: typo", got[0].Detail)
+	require.Equal(t, "[fork] fix: typo", got[1].Detail, "a deleted account is still an outside PR")
+	require.Equal(t, "fix: typo", got[2].Detail)
+}

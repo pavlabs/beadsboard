@@ -37,6 +37,7 @@ func runAgentRegister(args []string) error {
 	session := fs.String("session", "", "resumable session id")
 	cwd := fs.String("cwd", "", "working directory (default: PWD)")
 	pid := fs.Int("pid", 0, "process id for liveness")
+	pane := fs.String("pane", "", "zellij pane id for reattachment")
 	root := fs.String("root", "", "beads root (default: walk up from cwd for .beads)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -53,7 +54,7 @@ func runAgentRegister(args []string) error {
 		ID: *id, BeadID: *bead,
 		Tool: agentreg.Tool(*tool), Mode: agentreg.Mode(*mode),
 		Source: agentreg.Source(*source), SessionID: *session,
-		Cwd: dir, PID: *pid, StartedAt: time.Now(),
+		Cwd: dir, PID: *pid, PaneID: *pane, StartedAt: time.Now(),
 	})
 }
 

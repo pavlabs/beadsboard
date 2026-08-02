@@ -79,6 +79,8 @@ type agent struct {
 	backend         Backend
 	worktree        string
 	repoDir         string // the git repo its worktree was cut from
+	baseCommit      string // HEAD the worktree was cut from; used to detect landed commits
+	repo            string // GitHub owner/name used to look up a PR for Branch
 	cmd             *exec.Cmd
 	cancel          context.CancelFunc
 	tail            []string
@@ -118,6 +120,13 @@ type Commenter interface {
 	Comment(ctx context.Context, id, body string) error
 }
 
+// PullRequestFinder discovers open pull requests. beads.Client satisfies this
+// alongside Commenter, letting the manager detect artifacts instead of relying
+// on an agent to mention them in its final prose.
+type PullRequestFinder interface {
+	PullRequests(ctx context.Context, repos []string) ([]beads.PullRequest, error)
+}
+
 // Manager owns all running agents and the worktree/log scratch space. It is safe
 // for concurrent use; the UI reads snapshots and reacts to Events.
 type Manager struct {
@@ -132,6 +141,7 @@ type Manager struct {
 	events    chan struct{}
 	reg       *agentreg.Registry // shared .beadsboard/agents registry; nil if unavailable
 	commenter Commenter          // posts lifecycle milestones to the bead; nil disables it
+	pulls     PullRequestFinder  // discovers a PR for a finished agent's branch
 }
 
 // New builds a Manager for repoDir. claudeBin is the Claude Code executable
@@ -146,6 +156,7 @@ func newAt(repoDir, claudeBin string, maxAgents int, base string) *Manager {
 		backends: map[string]Backend{
 			string(agentreg.ToolClaude): claudeBackend{bin: claudeBin},
 			string(agentreg.ToolCodex):  codexBackend{bin: "codex"},
+			string(agentreg.ToolOllama): ollamaBackend{bin: "ollama"},
 		},
 		maxAgents: maxAgents,
 		logDir:    filepath.Join(base, "logs"),
@@ -182,7 +193,13 @@ func (m *Manager) regReap() {
 
 // SetCommenter wires the sink for bead-activity comments. Optional: a nil
 // commenter (the default) silently disables timeline posting.
-func (m *Manager) SetCommenter(c Commenter) { m.commenter = c }
+func (m *Manager) SetCommenter(c Commenter) {
+	m.commenter = c
+	m.pulls = nil
+	if pulls, ok := c.(PullRequestFinder); ok {
+		m.pulls = pulls
+	}
+}
 
 // comment posts a bead-activity line best-effort, off the caller's goroutine, so
 // an agent's lifecycle never blocks on or fails because of a comment error.
@@ -249,6 +266,10 @@ func (m *Manager) Spawn(spec Spec) (View, error) {
 	if srcRepo == "" {
 		srcRepo = m.repoDir
 	}
+	baseCommit, err := gitOutput(srcRepo, "rev-parse", "HEAD")
+	if err != nil {
+		return View{}, fmt.Errorf("resolve worktree base: %w", err)
+	}
 	wt := filepath.Join(m.wtDir, id)
 	branch := "beadsboard/" + id
 	if err := m.addWorktree(srcRepo, branch, wt); err != nil {
@@ -295,7 +316,8 @@ func (m *Manager) Spawn(spec Spec) (View, error) {
 			Status: Running, Branch: branch, Started: time.Now(),
 		},
 		backend:  b,
-		worktree: wt, repoDir: srcRepo, cmd: cmd, cancel: cancel, worktreePresent: true,
+		worktree: wt, repoDir: srcRepo, baseCommit: baseCommit, repo: spec.Repo,
+		cmd: cmd, cancel: cancel, worktreePresent: true,
 	}
 	a.rec = agentreg.Record{
 		ID: id, BeadID: spec.IssueID, Tool: tool, Mode: agentreg.ModeCoding,
@@ -390,17 +412,48 @@ func (m *Manager) finalize(a *agent, waitErr error, logPath string) {
 	}
 	wt, repoDir, id := a.worktree, a.repoDir, a.ID
 	beadID, status, result := a.IssueID, a.Status, a.pendingResult
+	baseCommit, branch, repo := a.baseCommit, a.Branch, a.repo
 	m.mu.Unlock()
+
+	landedBranch, pr := m.detectArtifacts(wt, baseCommit, branch, repo)
 
 	// The headless process has exited, so drop its registry record regardless of
 	// outcome; a needs-input agent stays visible via the in-memory Snapshot.
 	m.regRemove(id)
-	go m.comment(beadID, finishComment(id, status, result))
+	go m.comment(beadID, finishComment(id, status, landedBranch, pr, result))
 	_ = os.Remove(logPath) // logs are ephemeral; the question/outcome is kept in memory
 	if !keep {
 		m.removeWorktree(repoDir, wt)
 	}
 	m.ping()
+}
+
+// detectArtifacts runs while the worktree still exists. A branch is durable
+// work only when it has commits beyond the spawn-time HEAD; a PR is learned
+// from GitHub by matching that branch, never by scraping agent-authored prose.
+func (m *Manager) detectArtifacts(worktree, baseCommit, branch, repo string) (string, string) {
+	if baseCommit == "" || branch == "" {
+		return "", ""
+	}
+	count, err := gitOutput(worktree, "rev-list", "--count", baseCommit+"..HEAD")
+	if err != nil || count == "0" {
+		return "", ""
+	}
+	if m.pulls == nil || repo == "" {
+		return branch, ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	pulls, err := m.pulls.PullRequests(ctx, []string{repo})
+	if err != nil {
+		return branch, ""
+	}
+	for _, pull := range pulls {
+		if !pull.Fork && pull.Repo == repo && pull.Branch == branch {
+			return branch, pull.URL
+		}
+	}
+	return branch, ""
 }
 
 // Kill terminates a running agent; it moves to Killed. No-op for agents that are
@@ -550,6 +603,16 @@ func (m *Manager) addWorktree(repoDir, branch, path string) error {
 	return nil
 }
 
+func gitOutput(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 func (m *Manager) removeWorktree(repoDir, path string) {
 	_ = exec.Command("git", "-C", repoDir, "worktree", "remove", "--force", path).Run()
 }
@@ -609,8 +672,14 @@ func sessionComment(rec agentreg.Record) string {
 	return fmt.Sprintf("%s session agent=%s session=%s", commentTag, rec.ID, rec.SessionID)
 }
 
-func finishComment(id string, status Status, result string) string {
+func finishComment(id string, status Status, branch, pr, result string) string {
 	body := fmt.Sprintf("%s finish agent=%s status=%s", commentTag, id, status.label())
+	if branch != "" {
+		body += " branch=" + branch
+	}
+	if pr != "" {
+		body += " pr=" + pr
+	}
 	if r := firstLine(result); r != "" {
 		body += " result=" + r
 	}

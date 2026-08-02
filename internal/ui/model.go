@@ -19,6 +19,7 @@ import (
 	"github.com/pavlabs/beadsboard/internal/agentreg"
 	"github.com/pavlabs/beadsboard/internal/beads"
 	"github.com/pavlabs/beadsboard/internal/config"
+	"github.com/pavlabs/beadsboard/internal/dispatch"
 )
 
 // refreshInterval paces the watcher. Each poll is a full `bd export` (~0.4s on a
@@ -51,11 +52,14 @@ type model struct {
 	taskCursor int  // selected task when the task-list section is focused
 	taskOpen   bool // drilled into a task's detail page (reuses field motion)
 
-	editing bool            // inline editing the focused field
-	editSec int             // section being edited
-	input   textinput.Model // title editor
-	area    textarea.Model  // description/notes editor
-	choice  int             // status index / priority value while cycling
+	editing      bool            // inline editing the focused field
+	editSec      int             // section being edited
+	input        textinput.Model // title editor
+	area         textarea.Model  // description/notes editor
+	choice       int             // status index / priority value while cycling
+	creating     bool            // title form for a new epic or child task
+	createType   string          // epic | task
+	createParent string          // parent epic for a task; empty for an epic
 
 	cfg        config.Config
 	cfgPath    string // resolved config file we watch and save back to
@@ -65,9 +69,13 @@ type model struct {
 	reg          *agentreg.Registry // shared on-disk registry of agents working each bead
 	agentRecords []agentreg.Record  // last registry snapshot, read off the render path
 	agentAlive   map[string]bool    // liveness per record ID, computed with the snapshot
+	dispatchRun  *dispatch.Campaign // inactive until an epic subtree is dispatched
+	dispatchTool agentreg.Tool      // backend used for admitted campaign tasks
 
-	commentBead string          // bead the cached comments belong to; "" = none
-	comments    []beads.Comment // selected bead's activity timeline, read off the render path
+	commentBead   string          // bead the cached comments belong to; "" = none
+	comments      []beads.Comment // selected bead's activity timeline, read off the render path
+	commentsRev   uint64          // revision for the cached or currently requested timeline
+	commentsFresh bool            // false means no current request/cache, so the next tick retries
 
 	tab             int  // tabDetails | tabAgents
 	agentCursor     int  // selected agent in the Agents tab
@@ -91,7 +99,7 @@ type model struct {
 	pickerTarget  string // bead the launch acts on
 	pickerScope   string // "task" | "epic"
 	pickerMode    int    // pickCoding | pickPlanning
-	pickerBackend int    // pickClaude | pickCodex
+	pickerBackend int    // pickClaude | pickCodex | pickOllama
 
 	// rev is the revision hash of the issue data behind the current graph; 0
 	// means no load has landed yet (an fnv sum is never 0).
@@ -146,7 +154,7 @@ const (
 )
 
 // Launcher matrix rows (mode) and columns (backend). The chord letters are c/p
-// for the rows and l/o for the columns, so a blind `a c l` etc. lands a cell.
+// for the rows and l/o/m for the columns, so a blind `a c l` etc. lands a cell.
 const (
 	pickCoding = iota
 	pickPlanning
@@ -155,10 +163,11 @@ const (
 const (
 	pickClaude = iota
 	pickCodex
+	pickOllama
 )
 
 // pickerTools maps the backend column to its tool.
-var pickerTools = []agentreg.Tool{agentreg.ToolClaude, agentreg.ToolCodex}
+var pickerTools = []agentreg.Tool{agentreg.ToolClaude, agentreg.ToolCodex, agentreg.ToolOllama}
 
 // editStatuses are the statuses the status field cycles through when editing.
 var editStatuses = []string{"open", "in_progress", "blocked", "closed"}
@@ -183,12 +192,21 @@ type (
 		pulls []beads.PullRequest
 		err   error
 	}
-	editSavedMsg  struct{ err error }
-	deletedMsg    struct{ err error }
-	agentEventMsg struct{}
-	spawnedMsg    struct{ err error }
-	interveneMsg  struct{ err error }
-	pushedMsg     struct {
+	editSavedMsg     struct{ err error }
+	createdMsg       struct{ err error }
+	deletedMsg       struct{ err error }
+	agentEventMsg    struct{}
+	spawnedMsg       struct{ err error }
+	dispatchReadyMsg struct {
+		issues []beads.Issue
+		err    error
+	}
+	interveneMsg struct{ err error }
+	copiedMsg    struct {
+		what string
+		err  error
+	}
+	pushedMsg struct {
 		ids []string // beads that reached GitHub, whose digests are now current
 		err error
 	}
@@ -207,6 +225,8 @@ type (
 	commentsLoadedMsg struct {
 		bead     string
 		comments []beads.Comment
+		rev      uint64
+		err      error
 	}
 )
 
@@ -233,6 +253,7 @@ func New(dir string) model {
 	mgr.SetCommenter(client) // agents post lifecycle milestones onto the bead's timeline
 	mgr.Sweep()              // clear scratch from any prior crashed run
 	reg := agentreg.New(dir)
+	dispatchRun := dispatch.NewCampaign(dispatch.New(client, reg))
 
 	var modTime time.Time
 	if fi, err := os.Stat(cfgPath); err == nil {
@@ -240,19 +261,20 @@ func New(dir string) model {
 	}
 
 	return model{
-		client:     client,
-		loading:    true,
-		spinner:    sp,
-		detail:     viewport.New(0, 0),
-		input:      ti,
-		area:       ta,
-		search:     se,
-		cfg:        cfg,
-		cfgPath:    cfgPath,
-		cfgModTime: modTime,
-		mgr:        mgr,
-		reg:        reg,
-		subLinked:  map[string]bool{},
+		client:      client,
+		loading:     true,
+		spinner:     sp,
+		detail:      viewport.New(0, 0),
+		input:       ti,
+		area:        ta,
+		search:      se,
+		cfg:         cfg,
+		cfgPath:     cfgPath,
+		cfgModTime:  modTime,
+		mgr:         mgr,
+		reg:         reg,
+		dispatchRun: dispatchRun,
+		subLinked:   map[string]bool{},
 	}
 }
 
@@ -344,16 +366,65 @@ func (m model) commentsCmd() tea.Cmd {
 	if bead == "" {
 		return nil
 	}
-	client := m.client
+	client, rev := m.client, m.rev
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		comments, err := client.Comments(ctx, bead)
 		if err != nil {
-			return commentsLoadedMsg{bead: bead} // unreadable timeline reads as empty
+			return commentsLoadedMsg{bead: bead, rev: rev, err: err}
 		}
-		return commentsLoadedMsg{bead: bead, comments: comments}
+		return commentsLoadedMsg{bead: bead, comments: comments, rev: rev}
 	}
+}
+
+// refreshCommentsCmd avoids launching a second bd process on every idle tick.
+// The export revision includes comment_count, so a successful timeline remains
+// current until either the selected bead or the adopted export revision moves.
+// Stamp the issued revision here so Update's value receiver must preserve the
+// gate; a failed fetch clears the stamp in the message handler and is retried.
+func (m *model) refreshCommentsCmd() tea.Cmd {
+	bead := m.target()
+	if bead == "" || (m.commentsFresh && bead == m.commentBead && m.rev == m.commentsRev) {
+		return nil
+	}
+	m.commentsRev = m.rev
+	m.commentsFresh = true
+	return m.commentsCmd()
+}
+
+// openBeadCmd opens the selected bead's synced GitHub issue, the same way o
+// opens a pull request from the inbox. A bead with no issue yet has nothing to
+// open, and says so rather than doing nothing.
+func (m model) openBeadCmd() tea.Cmd {
+	id := m.target()
+	if m.graph == nil || id == "" {
+		return nil
+	}
+	ref := m.graph.Issues[id].ExternalRef
+	if ref == "" {
+		return func() tea.Msg {
+			return copiedMsg{err: fmt.Errorf("%s has no synced issue yet", beadRef(id))}
+		}
+	}
+	return openURL(ref)
+}
+
+// focusTasks jumps straight into the epic's task list, skipping the tab walk
+// through title, status, priority, description and notes.
+func (m model) focusTasks() (tea.Model, tea.Cmd) {
+	if m.taskOpen || m.graph == nil {
+		return m, nil // a task has no task list of its own
+	}
+	if len(m.visibleTasks()) == 0 {
+		return m, nil
+	}
+	m.focused = true
+	m.section = secTasks
+	m.tab = tabDetails
+	m.clampCursors()
+	m.syncDetail()
+	return m, nil
 }
 
 // startReload flips to the loading state and kicks off a fresh hydrate.
@@ -388,7 +459,7 @@ func (m model) adopt(graph *beads.Graph, rev uint64) (tea.Model, tea.Cmd) {
 		}
 	}
 	m.loading = false
-	return m, nil
+	return m, m.dispatchRefreshCmd()
 }
 
 // pushGroupsCmd pushes the given beads to their GitHub repos, grouped by the
@@ -519,6 +590,15 @@ func (m model) updateCmd(id, field, value string) tea.Cmd {
 	}
 }
 
+func (m model) createCmd(title, issueType, parent string) tea.Cmd {
+	client := m.client
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		return createdMsg{err: client.Create(ctx, title, issueType, parent)}
+	}
+}
+
 // handleConfirmDelete resolves the delete confirmation prompt: y deletes, any
 // other key cancels.
 func (m model) handleConfirmDelete(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -565,7 +645,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		m.reloadConfigIfChanged()
 		m.mgr.PruneRecent(time.Duration(m.cfg.RecentTTLSecs) * time.Second)
-		cmds := []tea.Cmd{tickCmd(), m.regCmd(), m.commentsCmd(), m.pullsCmd()}
+		cmds := []tea.Cmd{tickCmd(), m.regCmd(), m.refreshCommentsCmd(), m.pullsCmd()}
 		if !m.loading {
 			// A poll shells out to bd; skip it while a load or push already holds
 			// the board, rather than contending with it for the Dolt engine.
@@ -577,7 +657,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.clampAgentCursor()
 		m.clampBeadAgentCursor()
 		m.resizeDetail() // tab bar appearing/disappearing shifts the right pane
-		return m, tea.Batch(m.waitAgentEvent(), m.regCmd())
+		m.renderFields() // agent status/liveness can move without changing a bead
+		return m, tea.Batch(m.waitAgentEvent(), m.regCmd(), m.dispatchRefreshCmd())
+
+	case dispatchReadyMsg:
+		if msg.err != nil {
+			m.notice = msg.err.Error()
+			return m, nil
+		}
+		cmds := make([]tea.Cmd, 0, len(msg.issues))
+		for _, issue := range msg.issues {
+			cmds = append(cmds, m.spawnCmd(issue.ID, "task", m.dispatchTool))
+		}
+		return m, tea.Batch(cmds...)
 
 	case spawnedMsg:
 		if msg.err != nil {
@@ -618,6 +710,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m.startReload() // reflect the saved change; hydrate then pushes it up
 
+	case createdMsg:
+		if msg.err != nil {
+			m.loading = false
+			m.notice = msg.err.Error()
+			return m, nil
+		}
+		return m.startReload()
+
 	case deletedMsg:
 		if msg.err != nil {
 			m.loading = false
@@ -638,9 +738,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.err != nil {
 			m.notice = msg.err.Error()
-			return m, nil
+			return m, m.dispatchRefreshCmd()
 		}
-		return m, m.linkSubIssuesCmd() // mirror the epic→task hierarchy as sub-issues
+		return m, tea.Batch(m.linkSubIssuesCmd(), m.dispatchRefreshCmd())
 
 	case pullsLoadedMsg:
 		// Stamp the fetch either way: a GitHub outage must not turn into a retry
@@ -655,13 +755,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case copiedMsg:
+		if msg.err != nil {
+			m.notice = msg.err.Error()
+			return m, nil
+		}
+		m.notice = "copied: " + firstLine(msg.what)
+		return m, nil
+
 	case regLoadedMsg:
 		m.agentRecords, m.agentAlive = msg.records, msg.alive
+		m.clampAgentCursor()
 		m.clampBeadAgentCursor()
+		m.renderFields() // registry liveness changes do not move the bead revision
 		return m, nil
 
 	case commentsLoadedMsg:
+		if msg.err != nil {
+			// Preserve the last good timeline. Invalidate only the failed request's
+			// stamp so the next tick retries instead of caching an empty result.
+			if m.commentsRev == msg.rev {
+				m.commentsFresh = false
+			}
+			return m, nil
+		}
 		m.commentBead, m.comments = msg.bead, msg.comments
+		m.commentsRev = msg.rev
+		m.commentsFresh = true
 		m.renderFields() // fold the refreshed timeline into the details region
 		return m, nil
 
@@ -698,6 +818,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.creating {
+		return m.handleCreateKey(msg)
+	}
 	if m.editing {
 		return m.handleEditKey(msg)
 	}
@@ -728,6 +851,23 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "i":
 		// Board-wide, so it opens from anywhere rather than per-pane.
 		return m.openInbox()
+	case "o":
+		return m, m.openBeadCmd()
+	case "c":
+		text := m.copyText()
+		if text == "" {
+			return m, nil
+		}
+		return m, copyCmd(text)
+	case "t":
+		return m.focusTasks()
+	case "D":
+		if !m.loading {
+			if epic := m.currentEpic(); epic != "" {
+				m.openPicker(epic, "subtree")
+			}
+		}
+		return m, nil
 	}
 	if m.tab == tabAgents {
 		return m.handleAgentsKey(msg)
@@ -767,6 +907,10 @@ func (m model) handleLeftKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "d":
 		if id := m.currentEpic(); id != "" {
 			m.pendingDelete = id
+		}
+	case "n":
+		if !m.loading {
+			m.beginCreate("epic", "")
 		}
 	case "A":
 		m.tab = tabAgents
@@ -834,6 +978,10 @@ func (m model) handleRightKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.pendingDelete = id
 			}
 		}
+	case "n":
+		if !m.loading && m.section == secTasks {
+			m.beginCreate("task", m.currentEpic())
+		}
 	case "enter", "l", "right":
 		if m.section == secTasks && m.currentTask() != "" {
 			m.openTask()
@@ -854,6 +1002,38 @@ func (m model) handleRightKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+func (m *model) beginCreate(issueType, parent string) {
+	m.creating, m.createType, m.createParent = true, issueType, parent
+	m.input.SetValue("")
+	m.input.Focus()
+}
+
+func (m model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc":
+		m.creating = false
+		m.input.Blur()
+		return m, nil
+	case "enter":
+		title := strings.TrimSpace(m.input.Value())
+		if title == "" {
+			m.notice = "title is required"
+			return m, nil
+		}
+		issueType, parent := m.createType, m.createParent
+		m.creating = false
+		m.input.Blur()
+		m.loading = true
+		return m, tea.Batch(m.spinner.Tick, m.createCmd(title, issueType, parent))
+	}
+	m.notice = ""
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
 }
 
 // handleTaskKey drives a task's detail page, which reuses the epic's field

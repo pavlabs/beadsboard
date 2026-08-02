@@ -30,6 +30,7 @@ type (
 const (
 	ToolClaude Tool = "claude"
 	ToolCodex  Tool = "codex"
+	ToolOllama Tool = "ollama"
 
 	ModeCoding   Mode = "coding"
 	ModePlanning Mode = "planning"
@@ -45,6 +46,7 @@ type Record struct {
 	Tool      Tool      `json:"tool"`
 	Mode      Mode      `json:"mode"`
 	PID       int       `json:"pid"`
+	PaneID    string    `json:"pane_id,omitempty"`
 	SessionID string    `json:"session_id,omitempty"`
 	Cwd       string    `json:"cwd,omitempty"`
 	Branch    string    `json:"branch,omitempty"`

@@ -7,36 +7,61 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// A real `gh api graphql` response for an org's open PRs, trimmed to two nodes.
+// A real `gh api graphql` response for an org's open PRs, trimmed to three
+// nodes; the third is a fork PR whose branch imitates the board's convention.
 const pullsResponse = `{"data":{"search":{"nodes":[
  {"number":8,"title":"feat: add job-spec v0 contract","url":"https://github.com/zoomie-build/proto/pull/8",
   "isDraft":false,"updatedAt":"2026-07-29T17:38:00Z","mergeable":"MERGEABLE","reviewDecision":null,
-  "headRefName":"feat/jobspec-v0","repository":{"nameWithOwner":"zoomie-build/proto"},
+  "headRefName":"feat/jobspec-v0","isCrossRepository":false,"author":{"login":"artemijspavlovs"},
+  "repository":{"nameWithOwner":"zoomie-build/proto"},
   "closingIssuesReferences":{"nodes":[]},
   "commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"FAILURE"}}}]}},
  {"number":7,"title":"docs: record job-spec v0 schema design","url":"https://github.com/zoomie-build/proto/pull/7",
   "isDraft":false,"updatedAt":"2026-07-13T16:27:15Z","mergeable":"MERGEABLE","reviewDecision":null,
-  "headRefName":"beadsboard/zoomie-hgt.1-2","repository":{"nameWithOwner":"zoomie-build/proto"},
+  "headRefName":"beadsboard/zoomie-hgt.1-2","isCrossRepository":false,"author":{"login":"artemijspavlovs"},
+  "repository":{"nameWithOwner":"zoomie-build/proto"},
   "closingIssuesReferences":{"nodes":[{"url":"https://github.com/zoomie-build/proto/issues/5"}]},
+  "commits":{"nodes":[{"commit":{"statusCheckRollup":null}}]}},
+ {"number":9,"title":"chore: tidy","url":"https://github.com/zoomie-build/proto/pull/9",
+  "isDraft":false,"updatedAt":"2026-07-30T09:02:41Z","mergeable":"MERGEABLE","reviewDecision":null,
+  "headRefName":"beadsboard/zoomie-hgt.1-3","isCrossRepository":true,"author":{"login":"drive-by"},
+  "repository":{"nameWithOwner":"zoomie-build/proto"},
+  "closingIssuesReferences":{"nodes":[]},
   "commits":{"nodes":[{"commit":{"statusCheckRollup":null}}]}}
 ]}}}`
 
 func TestDecodePulls(t *testing.T) {
 	got, err := decodePulls([]byte(pullsResponse))
 	require.NoError(t, err)
-	require.Len(t, got, 2)
+	require.Len(t, got, 3)
 
 	require.Equal(t, "zoomie-build/proto", got[0].Repo)
 	require.Equal(t, 8, got[0].Number)
 	require.Equal(t, "proto#8", got[0].Ref())
 	require.Equal(t, "FAILURE", got[0].Checks)
 	require.False(t, got[0].Draft)
+	require.Equal(t, "artemijspavlovs", got[0].Author)
+	require.False(t, got[0].Fork)
 	require.Equal(t, time.Date(2026, 7, 29, 17, 38, 0, 0, time.UTC), got[0].Updated.UTC())
 	require.Empty(t, got[0].Closes)
 
 	// A null statusCheckRollup is "no checks configured", not a failure.
 	require.Empty(t, got[1].Checks)
 	require.Equal(t, []string{"https://github.com/zoomie-build/proto/issues/5"}, got[1].Closes)
+
+	require.True(t, got[2].Fork)
+	require.Equal(t, "drive-by", got[2].Author)
+}
+
+// A deleted account decodes as a null author, which is a PR like any other
+// rather than a decode failure.
+func TestDecodePullsWithoutAuthor(t *testing.T) {
+	got, err := decodePulls([]byte(`{"data":{"search":{"nodes":[
+	 {"number":1,"title":"t","url":"https://github.com/acme/w/pull/1","author":null,
+	  "repository":{"nameWithOwner":"acme/w"}}]}}}`))
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Empty(t, got[0].Author)
 }
 
 // An empty search is not an error — a board with no open PRs is normal.
@@ -86,6 +111,24 @@ func TestBeadForPrefersClosingIssue(t *testing.T) {
 	p := PullRequest{Branch: "beadsboard/bd-2", Closes: []string{"https://github.com/acme/w/issues/3"}}
 
 	require.Equal(t, "bd-1", BeadFor(p, g))
+}
+
+// A branch name on a fork is whatever an outsider typed, so it must not claim a
+// bead — otherwise any PR from anyone lands in the inbox as that bead's work.
+// A closing reference is a different thing: it names an issue that exists, so it
+// still counts however the PR arrived.
+func TestBeadForIgnoresForkBranch(t *testing.T) {
+	g := BuildGraph(map[string]Issue{
+		"zoomie-hgt.1": {ID: "zoomie-hgt.1", IssueType: "task", ExternalRef: "https://github.com/zoomie-build/proto/issues/5"},
+	})
+	pulls, err := decodePulls([]byte(pullsResponse))
+	require.NoError(t, err)
+
+	require.Empty(t, BeadFor(pulls[2], g))
+
+	claimed := pulls[2]
+	claimed.Closes = []string{"https://github.com/zoomie-build/proto/issues/5"}
+	require.Equal(t, "zoomie-hgt.1", BeadFor(claimed, g))
 }
 
 // No repos in scope means no call to make.
