@@ -19,6 +19,7 @@ func (c *taskCounts) add(is beads.Issue, status string) {
 	c.total++
 	if is.Status == "closed" {
 		c.finished++
+		return
 	}
 	switch status {
 	case beads.StatusWIP:
