@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -81,7 +82,7 @@ func TestRunSetupBootstrapsSingleRepoPlansThenEntersTUI(t *testing.T) {
 		EnterTUI: func(root string) error { order = append(order, "tui"); require.Equal(t, dir, root); return nil },
 	}
 	require.NoError(t, runSetup(setupOptions{Dir: dir, Yes: true, Layout: "single", GitHubRepo: "pavlabs/app", EnterTUI: true}, deps))
-	require.Equal(t, []string{"git init", "bd init"}, commands)
+	require.Equal(t, []string{"git init", "bd init", "bd config set github.repository pavlabs/app", "bd config set github.owner pavlabs", "bd config set github.repo app"}, commands)
 	require.Equal(t, []string{"pm", "tui"}, order)
 	cfg, path, err := config.Load(dir)
 	require.NoError(t, err)
@@ -93,9 +94,14 @@ func TestRunSetupBootstrapsSingleRepoPlansThenEntersTUI(t *testing.T) {
 
 func TestRunSetupMetaRepoDoesNotEnableSingleRepoSync(t *testing.T) {
 	dir := t.TempDir()
-	deps := setupDeps{In: bytes.NewBuffer(nil), Out: &bytes.Buffer{},
-		Run:     func(context.Context, string, string, ...string) error { return nil },
-		StartPM: func(string, config.Config) error { return nil }, EnterTUI: func(string) error { return nil }}
+	deps := setupDeps{
+		In: bytes.NewBuffer(nil), Out: &bytes.Buffer{},
+		Run: func(_ context.Context, _, bin string, args ...string) error {
+			require.NotContains(t, strings.Join(args, " "), "github.")
+			return nil
+		},
+		StartPM: func(string, config.Config) error { return nil }, EnterTUI: func(string) error { return nil },
+	}
 	require.NoError(t, runSetup(setupOptions{Dir: dir, Yes: true, Layout: "meta", GitHubRepo: "ignored/repo"}, deps))
 	cfg, _, err := config.Load(dir)
 	require.NoError(t, err)
@@ -103,13 +109,40 @@ func TestRunSetupMetaRepoDoesNotEnableSingleRepoSync(t *testing.T) {
 	require.False(t, cfg.GitHubSync)
 }
 
+func TestGitHubSetupValidationAndFailureBoundary(t *testing.T) {
+	for _, repo := range []string{"bad", "../repo", "owner/..", "owner/repo/extra", "owner/repo name"} {
+		dir := filepath.Join(t.TempDir(), "new")
+		err := runSetup(setupOptions{Dir: dir, Yes: true, Layout: "single", GitHubRepo: repo}, setupDeps{Out: &bytes.Buffer{}, In: bytes.NewBuffer(nil), Run: func(context.Context, string, string, ...string) error {
+			t.Fatal("mutated before validation")
+			return nil
+		}})
+		require.ErrorContains(t, err, "owner/repo")
+		require.NoDirExists(t, dir)
+	}
+	dir := t.TempDir()
+	err := runSetup(setupOptions{Dir: dir, Yes: true, Layout: "single", GitHubRepo: "pavlabs/app"}, setupDeps{
+		Out: &bytes.Buffer{}, In: bytes.NewBuffer(nil),
+		Run: func(_ context.Context, _, bin string, args ...string) error {
+			if bin == "bd" && args[0] == "config" {
+				return errors.New("database unavailable")
+			}
+			return nil
+		},
+		StartPM: func(string, config.Config) error { t.Fatal("PM launched after setup failure"); return nil },
+	})
+	require.ErrorContains(t, err, "configure github.repository")
+	require.NoFileExists(t, config.LocalPath(dir))
+}
+
 func TestRunSetupInteractiveExplainsAndSelectsMeta(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "existing.txt"), []byte("work\n"), 0o644))
 	var out bytes.Buffer
-	deps := setupDeps{In: bytes.NewBufferString("yes\nmeta\n"), Out: &out,
+	deps := setupDeps{
+		In: bytes.NewBufferString("yes\nmeta\n"), Out: &out,
 		Run:     func(context.Context, string, string, ...string) error { return nil },
-		StartPM: func(string, config.Config) error { return nil }, EnterTUI: func(string) error { return nil }}
+		StartPM: func(string, config.Config) error { return nil }, EnterTUI: func(string) error { return nil },
+	}
 	require.NoError(t, runSetup(setupOptions{Dir: dir}, deps))
 	require.Contains(t, out.String(), "existing, unplanned")
 	require.Contains(t, out.String(), "single keeps code and Beads together")
