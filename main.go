@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -10,6 +12,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/pavlabs/beadsboard/internal/ui"
+	"github.com/pavlabs/beadsboard/internal/usage"
 )
 
 // version is stamped via -ldflags at release build time; otherwise it falls
@@ -17,6 +20,18 @@ import (
 var version = ""
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "usage" {
+		// A diagnostic for the same read-only adapters used by the TUI.
+		var snapshots []usage.Snapshot
+		for _, provider := range []string{"Codex", "Claude"} {
+			snapshots = append(snapshots, usage.Fetch(context.Background(), provider))
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(snapshots); err != nil {
+			fmt.Fprintln(os.Stderr, "beadsboard:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "init" {
 		if err := runInitCmd(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "beadsboard:", err)

@@ -36,6 +36,20 @@ func TestGraphStatuses(t *testing.T) {
 	require.Empty(t, g.OpenBlockerRefs("a.2"))
 }
 
+func TestOnlyOpenUnblockedTasksAreReady(t *testing.T) {
+	issues := map[string]Issue{}
+	for _, status := range []string{"open", "blocked", "deferred", "in_progress", "closed", "awaiting_review"} {
+		issues[status] = Issue{ID: status, IssueType: "task", Status: status}
+	}
+	g := BuildGraph(issues)
+	require.Equal(t, StatusReady, g.TaskStatus["open"])
+	require.Equal(t, StatusBlocked, g.TaskStatus["blocked"])
+	require.Equal(t, StatusWIP, g.TaskStatus["in_progress"])
+	require.Equal(t, StatusDone, g.TaskStatus["closed"])
+	require.Equal(t, StatusOpen, g.TaskStatus["deferred"])
+	require.Equal(t, StatusOpen, g.TaskStatus["awaiting_review"])
+}
+
 func TestGraphTopoOrderWithinEpic(t *testing.T) {
 	g := BuildGraph(fixture())
 	require.Equal(t, []string{"a.1", "a.2"}, g.Tasks["a"], "prerequisite lists before what it unblocks")

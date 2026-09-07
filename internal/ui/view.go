@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/pavlabs/beadsboard/internal/beads"
 )
@@ -16,6 +17,12 @@ func (m model) layout() (leftOuter, rightOuter, innerH int) {
 	leftOuter = min(46, max(m.width/2, 1))
 	rightOuter = max(m.width-leftOuter-1, 10)
 	innerH = max(m.height-2 /*header+footer*/ -2 /*pane borders*/, 1)
+	if m.showUsageBar() {
+		innerH = max(innerH-2, 1)
+	}
+	if m.fullscreen || m.tab == tabDashboard {
+		leftOuter, rightOuter = 0, max(m.width, 4)
+	}
 	return
 }
 
@@ -44,14 +51,10 @@ func (m *model) resizeDetail() {
 	m.area.SetHeight(max(m.detail.Height-4, 3))
 }
 
-// rightInnerH is the right pane's usable inner height, one row less than the
-// left pane's when the tab bar is shown (i.e. when any agent exists).
+// rightInnerH reserves one row for persistent tab navigation.
 func (m model) rightInnerH() int {
 	_, _, innerH := m.layout()
-	if m.hasAgents() {
-		return innerH - 1
-	}
-	return innerH
+	return max(innerH-1, 1)
 }
 
 func (m model) View() string {
@@ -71,7 +74,10 @@ func (m model) View() string {
 		body = m.panes()
 	}
 
-	return strings.Join([]string{header, body, footer}, "\n")
+	if m.showUsageBar() {
+		body += "\n" + ansi.Truncate(m.usageSummary(0, false), m.width, "…") + "\n" + ansi.Truncate(m.usageSummary(1, false), m.width, "…")
+	}
+	return strings.Join([]string{ansi.Truncate(header, m.width, "…"), body, ansi.Truncate(footer, m.width, "…")}, "\n")
 }
 
 func (m model) headerLine() string {
@@ -144,6 +150,8 @@ func (m model) footerLine() string {
 	}
 	var keys string
 	switch {
+	case m.tab == tabDashboard:
+		keys = "v/esc back · ↑/↓ scroll · r refresh · i inbox · q quit"
 	case m.tab == tabAgents:
 		keys = "↑/↓ select · enter intervene/reattach · k kill · x dismiss · w wrap · A all · S settings · m back"
 	case m.editing:
@@ -156,18 +164,21 @@ func (m model) footerLine() string {
 			keys = "ctrl+s save · esc cancel · enter = newline"
 		}
 	case m.taskOpen && m.section == secAgents:
-		keys = "↑/↓ select · x kill · tab field · esc back · q quit"
+		keys = "f fullscreen · ↑/↓ select · x kill · tab field · esc back · v dashboard"
 	case m.taskOpen:
-		keys = "tab field · e edit · c copy · o issue · ↑/↓ scroll · esc back · q quit"
+		keys = "f fullscreen · tab field · e edit · c copy · o issue · ↑/↓ scroll · esc back · v dashboard"
 	case m.focused && m.section == secTasks:
-		keys = "↑/↓ task · enter open · D auto-run · n new · c copy · o issue · / search · tab section · esc back"
+		keys = "A all · O open · C closed · f fullscreen · enter open · / search · D auto-run · v dashboard · esc back"
 	case m.focused:
 		keys = "tab section · D auto-run · t tasks · e edit · c copy · o issue · esc back · q quit"
 	default:
-		keys = "↑/↓ move · → open · D auto-run · n new · t tasks · c copy · o issue · / search · i inbox · A agents · r refresh · q quit"
+		keys = "v dashboard · t tasks · ↑/↓ move · → open · D auto-run · n new · c copy · o issue · / search · i inbox · A agents · r refresh · q quit"
 		if m.cfg.GitHubSync {
 			keys += " · G github-pull"
 		}
+	}
+	if m.fullscreen && !m.editing {
+		keys = "f/esc restore · tab field · e edit · ↑/↓ scroll · v dashboard · q quit"
 	}
 	return dimStyle.Render("  " + keys)
 }
@@ -186,6 +197,8 @@ func (m model) panes() string {
 		right = boxStyle.Width(rightOuter - 2).Height(rh).Render(m.pickerView(rightInner, rh))
 	case m.settingsOpen:
 		right = boxStyle.Width(rightOuter - 2).Height(rh).Render(m.settingsView(rightInner, rh))
+	case m.tab == tabDashboard:
+		right = boxStyle.Width(rightOuter - 2).Height(rh).Render(m.dashboardView(rightInner, rh))
 	case m.tab == tabAgents:
 		right = m.agentsColumn(rightOuter, rh)
 	case m.taskOpen:
@@ -198,8 +211,9 @@ func (m model) panes() string {
 		right = lipgloss.JoinVertical(lipgloss.Left, fields, tasks)
 	}
 
-	if m.hasAgents() {
-		right = lipgloss.JoinVertical(lipgloss.Left, m.tabBar(rightOuter-2), right)
+	right = lipgloss.JoinVertical(lipgloss.Left, m.tabBar(rightOuter-2), right)
+	if leftOuter == 0 {
+		return right
 	}
 	return lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right)
 }
@@ -208,7 +222,7 @@ func (m model) panes() string {
 // list split beside a read-only preview of the hovered task once the task-list
 // section is focused.
 func (m model) taskBox(width, height int) string {
-	if !m.focused || m.section != secTasks {
+	if !m.focused || m.section != secTasks || width < 60 {
 		return m.taskListContent(width, height)
 	}
 	listW := max(width/2, 8)
@@ -228,6 +242,9 @@ func (m model) taskPreviewContent(width, height int) string {
 	lines := strings.Split(m.fields(id, width), "\n")
 	if len(lines) > height {
 		lines = lines[:height]
+	}
+	for i, line := range lines {
+		lines[i] = ansi.Truncate(line, width, "…")
 	}
 	return strings.Join(lines, "\n")
 }
@@ -328,21 +345,23 @@ func (m model) taskListContent(width, height int) string {
 	filtered := m.searchScope == scopeTasks && m.query() != ""
 
 	var b strings.Builder
-	hdr := fmt.Sprintf("TASKS (%d)", len(tasks))
+	hdr := fmt.Sprintf("TASKS (%d) %s", len(tasks), m.taskFilterName())
 	if filtered {
 		hdr += " /" + m.query()
 	}
 	if active {
-		b.WriteString(selectedStyle.Render(" " + hdr + " "))
+		b.WriteString(selectedStyle.Render(ansi.Truncate(" "+hdr+" ", width, "…")))
 	} else {
-		b.WriteString(dimStyle.Render(hdr))
+		b.WriteString(dimStyle.Render(ansi.Truncate(hdr, width, "…")))
 	}
 	if len(tasks) == 0 {
 		msg := "no tasks"
 		if filtered {
 			msg = "no match"
+		} else if m.taskFilter != tasksAll {
+			msg = "no " + m.taskFilterName() + " tasks; A shows all"
 		}
-		fmt.Fprintf(&b, "\n%s", dimStyle.Render(msg))
+		fmt.Fprintf(&b, "\n%s", dimStyle.Render(ansi.Truncate(msg, width, "…")))
 		return b.String()
 	}
 	b.WriteString("\n\n")

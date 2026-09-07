@@ -11,6 +11,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/pavlabs/beadsboard/internal/agent"
 	"github.com/pavlabs/beadsboard/internal/agentreg"
@@ -657,12 +658,6 @@ func (m *model) killBeadAgent() {
 	m.clampBeadAgentCursor()
 }
 
-// hasAgents gates the tab bar. It counts registry records too, so the tab does
-// not vanish across a restart while agents are still registered and running.
-func (m model) hasAgents() bool {
-	return len(m.mgr.Snapshot()) > 0 || len(m.agentRecords) > 0
-}
-
 func (m model) anyNeedsInput() bool {
 	for _, a := range m.mgr.Snapshot() {
 		if a.Status == agent.NeedsInput {
@@ -753,11 +748,16 @@ func (m model) tabBar(width int) string {
 			label += " !"
 		}
 	}
-	det, ag := " Details ", " "+label+" "
-	if m.tab == tabAgents {
-		return dimStyle.Render(det) + selectedStyle.Render(ag)
+	labels := []string{" Details ", " " + label + " ", " Dashboard (v) "}
+	var out string
+	for i, text := range labels {
+		if i == m.tab {
+			out += selectedStyle.Render(text)
+		} else {
+			out += dimStyle.Render(text)
+		}
 	}
-	return selectedStyle.Render(det) + dimStyle.Render(ag)
+	return ansi.Truncate(out, width, "…")
 }
 
 // agentsColumn stacks the agent list over the selected agent's preview.

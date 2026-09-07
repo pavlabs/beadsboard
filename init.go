@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -114,6 +115,14 @@ func runSetup(opts setupOptions, deps setupDeps) error {
 	if layout != "single" && layout != "meta" {
 		return fmt.Errorf("--layout must be single or meta")
 	}
+	repo := strings.TrimSpace(opts.GitHubRepo)
+	if layout == "single" && repo != "" {
+		parts := strings.Split(repo, "/")
+		valid := regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+		if len(parts) != 2 || !valid.MatchString(parts[0]) || !valid.MatchString(parts[1]) || parts[0] == "." || parts[0] == ".." || parts[1] == "." || parts[1] == ".." {
+			return fmt.Errorf("--github-repo must be owner/repo")
+		}
+	}
 	if err := os.MkdirAll(abs, 0o755); err != nil {
 		return err
 	}
@@ -129,8 +138,18 @@ func runSetup(opts setupOptions, deps setupDeps) error {
 	}
 	cfg := config.Default()
 	cfg.ProjectLayout = layout
-	cfg.GitHubRepository = strings.TrimSpace(opts.GitHubRepo)
+	cfg.GitHubRepository = repo
 	cfg.GitHubSync = layout == "single" && cfg.GitHubRepository != ""
+	if cfg.GitHubSync {
+		// Persist bd's native default as well as the board's routing setting.
+		// Credentials belong to the CLI login/environment, never the project DB.
+		owner, name, _ := strings.Cut(repo, "/")
+		for _, setting := range [][2]string{{"github.repository", repo}, {"github.owner", owner}, {"github.repo", name}} {
+			if err := deps.Run(context.Background(), abs, "bd", "config", "set", setting[0], setting[1]); err != nil {
+				return fmt.Errorf("configure %s: %w; complete native GitHub settings with bd config set before enabling sync", setting[0], err)
+			}
+		}
+	}
 	cfg.PMSession = newPMSession()
 	cfg.PMSummary = "Project manager initialized. Recover current plans with bd prime before proposing changes."
 	if err := config.Save(cfg, config.LocalPath(abs)); err != nil {
