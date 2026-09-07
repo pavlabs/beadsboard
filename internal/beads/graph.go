@@ -136,8 +136,12 @@ func (g *Graph) deriveStatuses() {
 			g.TaskStatus[id] = StatusDone
 		case is.Status == "in_progress":
 			g.TaskStatus[id] = StatusWIP
-		case len(open) == 0:
+		case is.Status == "blocked":
+			g.TaskStatus[id] = StatusBlocked
+		case is.Status == "open" && len(open) == 0:
 			g.TaskStatus[id] = StatusReady
+		case len(open) == 0:
+			g.TaskStatus[id] = StatusOpen
 		default:
 			g.TaskStatus[id] = StatusBlocked
 		}
