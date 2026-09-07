@@ -54,8 +54,7 @@ func TestInboxEmptyState(t *testing.T) {
 	require.Contains(t, m.View(), "nothing needs you")
 }
 
-// enter lands the cursor on the bead: its epic selected, the task highlighted
-// in the task list, and the overlay closed.
+// Enter opens the actual task, with its epic selected and the overlay closed.
 func TestInboxJumpsToBead(t *testing.T) {
 	next, _ := blockedModel().handleKey(keyMsg("i"))
 	next, _ = next.(model).handleKey(keyMsg("enter"))
@@ -65,7 +64,9 @@ func TestInboxJumpsToBead(t *testing.T) {
 	require.Equal(t, "b", m.graph.Epics[m.epicCursor])
 	require.Equal(t, "b.1", m.currentTask())
 	require.True(t, m.focused)
-	require.Equal(t, secTasks, m.section)
+	require.True(t, m.taskOpen)
+	require.Equal(t, "b.1", m.target())
+	require.Equal(t, secTitle, m.section)
 }
 
 // esc closes without moving the board's cursor.

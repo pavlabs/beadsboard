@@ -82,34 +82,60 @@ func openURL(raw string) tea.Cmd {
 // acting on an attention item lands where the work is. A task drills into its
 // epic's list; an epic just selects it.
 func (m model) jumpToBead(bead string) (tea.Model, tea.Cmd) {
-	m.inboxOpen = false
 	if m.graph == nil || bead == "" {
+		m.notice = "No linked bead for this item; use o to open its PR"
+		return m, nil
+	}
+	if _, ok := m.graph.Issues[bead]; !ok {
+		m.notice = "Bead no longer exists: " + bead
 		return m, nil
 	}
 	epic := bead
 	if !m.graph.Issues[bead].IsEpic() {
 		epic = m.graph.EpicOf(bead)
+		if epic == "" {
+			for parent, tasks := range m.graph.Tasks {
+				if indexOf(tasks, bead) >= 0 {
+					epic = parent
+					break
+				}
+			}
+		}
 	}
 	// The cursors index the *visible* lists, not the graph's, so a jump taken
 	// while a search filter is active has to resolve against the same view every
 	// other cursor writer uses — otherwise it selects the wrong epic.
 	i := indexOf(m.visibleEpics(), epic)
 	if i < 0 {
-		return m, nil
+		m.clearSearch()
+		i = indexOf(m.visibleEpics(), epic)
+		if i < 0 {
+			m.notice = "Cannot locate bead: " + bead
+			return m, nil
+		}
 	}
+	m.inboxOpen = false
 	m.epicCursor = i
 	m.taskCursor = 0
 	m.taskOpen = false
+	m.fullscreen = false
 	m.focused = false
 	m.tab = tabDetails
 	if epic != bead {
+		if indexOf(m.visibleTasks(), bead) < 0 {
+			m.clearSearch()
+			if indexOf(m.visibleTasks(), bead) < 0 {
+				m.taskFilter = tasksAll
+			}
+		}
 		if j := indexOf(m.visibleTasks(), bead); j >= 0 {
 			m.taskCursor = j
 			m.focused = true
-			m.section = secTasks
+			m.openTask()
 		}
 	}
 	m.clampCursors()
+	m.resizeDetail()
 	m.syncDetail()
 	return m, m.commentsCmd()
 }

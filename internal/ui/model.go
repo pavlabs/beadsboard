@@ -47,10 +47,18 @@ type model struct {
 	searchScope int             // which list the query filters (scope* below)
 	search      textinput.Model // fuzzy search query
 
-	focused    bool // right pane (fields + tasks) has focus
-	section    int  // which right-pane section is selected (sec* below)
-	taskCursor int  // selected task when the task-list section is focused
-	taskOpen   bool // drilled into a task's detail page (reuses field motion)
+	focused         bool // right pane (fields + tasks) has focus
+	section         int  // which right-pane section is selected (sec* below)
+	taskCursor      int  // selected task when the task-list section is focused
+	taskOpen        bool // drilled into a task's detail page (reuses field motion)
+	taskFilter      int  // tasksAll | tasksOpen | tasksClosed; display only
+	fullscreen      bool
+	fullFromTask    bool
+	fullSection     int
+	fullOffset      int
+	dashboardOffset int
+	dashboardFrom   int
+	usage           [2]usageState
 
 	editing      bool            // inline editing the focused field
 	editSec      int             // section being edited
@@ -77,7 +85,7 @@ type model struct {
 	commentsRev   uint64          // revision for the cached or currently requested timeline
 	commentsFresh bool            // false means no current request/cache, so the next tick retries
 
-	tab             int  // tabDetails | tabAgents
+	tab             int  // tabDetails | tabAgents | tabDashboard
 	agentCursor     int  // selected agent in the Agents tab
 	beadAgentCursor int  // selected row in a task detail page's per-bead agents ledger
 	showAll         bool // Agents tab: all agents vs scoped to the hovered epic
@@ -126,6 +134,13 @@ type model struct {
 const (
 	tabDetails = iota
 	tabAgents
+	tabDashboard
+)
+
+const (
+	tasksAll = iota
+	tasksOpen
+	tasksClosed
 )
 
 // Right-pane sections the cursor cycles through with tab.
@@ -416,7 +431,7 @@ func (m model) focusTasks() (tea.Model, tea.Cmd) {
 	if m.taskOpen || m.graph == nil {
 		return m, nil // a task has no task list of its own
 	}
-	if len(m.visibleTasks()) == 0 {
+	if m.currentEpic() == "" {
 		return m, nil
 	}
 	m.focused = true
@@ -441,12 +456,22 @@ func (m model) adopt(graph *beads.Graph, rev uint64) (tea.Model, tea.Cmd) {
 	// Diff against what was on screen before adopting, so only the beads that
 	// actually moved get pushed.
 	changed := beads.ChangedForSync(m.graph, graph)
+	selectedEpic, selectedTask := m.currentEpic(), m.currentTask()
 
 	m.err = nil
 	m.graph = graph
 	m.rev = rev
 	m.loadGen++
+	if i := indexOf(m.visibleEpics(), selectedEpic); i >= 0 {
+		m.epicCursor = i
+	}
+	if i := indexOf(m.visibleTasks(), selectedTask); i >= 0 {
+		m.taskCursor = i
+	} else if m.taskOpen {
+		m.taskOpen, m.fullscreen, m.section = false, false, secTasks
+	}
 	m.clampCursors()
+	m.resizeDetail()
 	m.syncDetail()
 	if m.cfg.GitHubSync {
 		// Hold loading so the watcher can't fire a concurrent push mid-sync;
@@ -632,7 +657,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
-		return m.handleKey(msg)
+		next, cmd := m.handleKey(msg)
+		updated := next.(model)
+		updated.resizeDetail()
+		usageCmd := updated.usageCmd()
+		return updated, tea.Batch(cmd, usageCmd)
+
+	case usageLoadedMsg:
+		state := &m.usage[msg.index]
+		state.inFlight = false
+		if msg.snapshot.Error != "" && len(state.snapshot.Windows) > 0 {
+			state.snapshot.Error = msg.snapshot.Error
+		} else {
+			state.snapshot = msg.snapshot
+		}
+		return m, nil
 
 	case hydratedMsg:
 		if msg.err != nil {
@@ -645,7 +684,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		m.reloadConfigIfChanged()
 		m.mgr.PruneRecent(time.Duration(m.cfg.RecentTTLSecs) * time.Second)
-		cmds := []tea.Cmd{tickCmd(), m.regCmd(), m.refreshCommentsCmd(), m.pullsCmd()}
+		cmds := []tea.Cmd{tickCmd(), m.regCmd(), m.refreshCommentsCmd(), m.pullsCmd(), m.usageCmd()}
 		if !m.loading {
 			// A poll shells out to bd; skip it while a load or push already holds
 			// the board, rather than contending with it for the Dolt engine.
@@ -656,7 +695,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case agentEventMsg:
 		m.clampAgentCursor()
 		m.clampBeadAgentCursor()
-		m.resizeDetail() // tab bar appearing/disappearing shifts the right pane
+		m.resizeDetail()
 		m.renderFields() // agent status/liveness can move without changing a bead
 		return m, tea.Batch(m.waitAgentEvent(), m.regCmd(), m.dispatchRefreshCmd())
 
@@ -851,6 +890,20 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "i":
 		// Board-wide, so it opens from anywhere rather than per-pane.
 		return m.openInbox()
+	case "v":
+		if m.tab == tabDashboard {
+			m.tab = m.dashboardFrom
+		} else {
+			m.dashboardFrom, m.tab = m.tab, tabDashboard
+		}
+		m.resizeDetail()
+		m.renderFields()
+		return m, nil
+	}
+	if m.tab == tabDashboard {
+		return m.handleDashboardKey(msg)
+	}
+	switch msg.String() {
 	case "o":
 		return m, m.openBeadCmd()
 	case "c":
@@ -938,6 +991,25 @@ func (m model) handleLeftKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // handleRightKey drives the fields + task-list sections of the right pane.
 func (m model) handleRightKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
+	case "A", "O", "C":
+		if m.section == secTasks {
+			selected := m.currentTask()
+			switch msg.String() {
+			case "A":
+				m.taskFilter = tasksAll
+			case "O":
+				m.taskFilter = tasksOpen
+			case "C":
+				m.taskFilter = tasksClosed
+			}
+			m.taskCursor = max(indexOf(m.visibleTasks(), selected), 0)
+			m.clampCursors()
+			m.syncDetail()
+		}
+	case "f":
+		if m.section == secTasks && m.currentTask() != "" {
+			m.enterFullscreen()
+		}
 	case "esc":
 		if m.searchScope == scopeTasks && m.query() != "" {
 			m.clearSearch() // first esc clears the task filter, stay focused
@@ -1040,8 +1112,18 @@ func (m model) handleCreateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // motion (title→status→priority→description→notes) but has no task-list section.
 func (m model) handleTaskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
+	case "f":
+		if m.fullscreen {
+			m.exitFullscreen()
+		} else {
+			m.enterFullscreen()
+		}
 	case "esc", "h", "left":
-		m.closeTask()
+		if m.fullscreen {
+			m.exitFullscreen()
+		} else {
+			m.closeTask()
+		}
 	case "tab":
 		m.section = (m.section + 1) % taskSectionCount
 		m.syncDetail()
@@ -1094,6 +1176,7 @@ func (m *model) openTask() {
 
 // closeTask returns from a task's detail page to the epic's task list.
 func (m *model) closeTask() {
+	m.fullscreen = false
 	m.taskOpen = false
 	m.section = secTasks
 	m.beadAgentCursor = 0
@@ -1157,9 +1240,10 @@ func (m model) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// fuzzyFilter keeps the ids whose text loosely matches query, ranked best-first
-// (tighter, earlier matches win; original order breaks ties).
+// fuzzyFilter matches titles and full/displayed IDs independently. An exact ID
+// wins over incidental title matches; otherwise tighter, earlier matches win.
 func fuzzyFilter(ids []string, query string, text func(string) string) []string {
+	query = strings.TrimSpace(query)
 	if query == "" {
 		return ids
 	}
@@ -1170,8 +1254,17 @@ func fuzzyFilter(ids []string, query string, text func(string) string) []string 
 	}
 	var hits []scored
 	for i, id := range ids {
-		if s, ok := fuzzyScore(text(id), query); ok {
-			hits = append(hits, scored{id, s, i})
+		best, matched := 0, false
+		for _, candidate := range []string{text(id), id, beadRef(id), shortID(id)} {
+			if score, ok := fuzzyScore(candidate, query); ok && (!matched || score < best) {
+				best, matched = score, true
+			}
+		}
+		if strings.EqualFold(id, query) || strings.EqualFold(beadRef(id), query) || strings.EqualFold(shortID(id), query) {
+			best, matched = -1, true
+		}
+		if matched {
+			hits = append(hits, scored{id, best, i})
 		}
 	}
 	sort.SliceStable(hits, func(a, b int) bool {
@@ -1411,12 +1504,45 @@ func (m model) visibleEpics() []string {
 // task-scoped filter.
 func (m model) visibleTasks() []string {
 	tasks := m.currentEpicTasks()
+	if m.taskFilter != tasksAll {
+		var filtered []string
+		for _, id := range tasks {
+			closed := m.graph.Issues[id].Status == "closed"
+			if (m.taskFilter == tasksClosed) == closed {
+				filtered = append(filtered, id)
+			}
+		}
+		tasks = filtered
+	}
 	if m.searchScope == scopeTasks && m.query() != "" {
-		return fuzzyFilter(tasks, m.query(), func(id string) string {
+		tasks = fuzzyFilter(tasks, m.query(), func(id string) string {
 			return m.graph.Issues[id].Title
 		})
 	}
+	if m.taskFilter == tasksOpen {
+		sort.SliceStable(tasks, func(i, j int) bool {
+			return m.graph.Issues[tasks[i]].Status == "in_progress" && m.graph.Issues[tasks[j]].Status != "in_progress"
+		})
+	}
 	return tasks
+}
+
+func (m *model) enterFullscreen() {
+	m.fullFromTask, m.fullSection, m.fullOffset = m.taskOpen, m.section, m.detail.YOffset
+	if !m.taskOpen {
+		m.openTask()
+	}
+	m.fullscreen = true
+	m.resizeDetail()
+	m.renderFields()
+}
+
+func (m *model) exitFullscreen() {
+	m.fullscreen = false
+	m.taskOpen, m.section = m.fullFromTask, m.fullSection
+	m.resizeDetail()
+	m.renderFields()
+	m.detail.SetYOffset(m.fullOffset)
 }
 
 // target is the issue that field navigation and editing act on: the drilled-into

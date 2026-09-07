@@ -24,11 +24,12 @@ func registryModel() model {
 	return m
 }
 
-// The registry is what survives a restart, so the tab bar has to count it —
-// otherwise the tab silently disappears while agents are still running.
-func TestTabBarCountsRegistryAgents(t *testing.T) {
-	require.False(t, testModel().hasAgents())
-	require.True(t, registryModel().hasAgents())
+// Navigation stays discoverable with or without registered agents.
+func TestTabBarAlwaysShowsAgentsAndDashboard(t *testing.T) {
+	for _, m := range []model{testModel(), registryModel()} {
+		require.Contains(t, m.panes(), "Agents")
+		require.Contains(t, m.panes(), "Dashboard (v)")
+	}
 }
 
 // An agent this board never started is listed, with its bead and who runs it.

@@ -24,7 +24,25 @@ beadsboard --version
   `←/→`, description/notes in a multiline editor. Saved straight through `bd update`;
   no `$EDITOR` handoff.
 - **Fuzzy search** with `/`, scoped to whichever list is in view (epics or an epic's
-  tasks). **`w`** wraps long epic titles.
+  tasks). Matches titles, full IDs, and short IDs such as `zjh.1` or `#1`;
+  exact ID matches rank first. **`w`** wraps long epic titles.
+- **Task filters.** With the epic's task list focused (`t`), `A` shows all tasks,
+  `C` closed tasks, and `O` unfinished tasks with in-progress work first. The
+  filter applies across epics for the current session and composes with search.
+  Epic totals and `D` dispatch continue to use the complete task set.
+- **Fullscreen task details.** `f` expands the selected task across the terminal.
+  `f` or `Esc` restores the previous list or detail view. Editing and scrolling
+  work in fullscreen; narrow task panes omit the side preview.
+- **Live dashboard.** `v` opens a board-wide dashboard with task completion,
+  in-progress, ready and blocked counts, plus percentages per priority. Each row
+  uses that priority's total tasks; ready is a subset of open (unfinished) work.
+  Epics are counted separately. `v` or `Esc` returns to the previous view.
+- **Account limits.** The dashboard and task status bar show Claude and Codex
+  subscription usage and reset times from your existing CLI logins. Checks run
+  once a minute while either surface is visible, without starting a model turn.
+  Failed checks retain the last sample marked `STALE` and retry after five minutes.
+  The actual provider windows are shown (usually 5 hours and 7 days), not invented
+  daily limits; missing windows and reset times are not treated as zero usage.
 - **Agent launcher.** `a` opens a backend matrix: Claude and Codex can run autonomous
   coding agents in isolated git worktrees or planning sessions; Ollama supports
   planning sessions only because its plain CLI has no tool loop. The **Agents** tab shows each agent's live
@@ -37,6 +55,8 @@ beadsboard --version
   died mid-task, blocked beads, and open pull requests that need a human — one list,
   most urgent first. `enter` jumps the board to the bead; `o` opens the PR. A badge in
   the header counts them so nothing off-screen goes unnoticed.
+  Task jumps open the detail page, including orphaned tasks; filters hiding the
+  destination are cleared as needed. An unlinked PR stays in the inbox for `o`.
 - **Pull requests across repos.** One GitHub search covers every sub-repo the board
   actually tracks and folds the results into the same inbox, each labelled with why it wants
   you — changes requested, checks red, conflicted, waiting on review, approved and
@@ -152,6 +172,21 @@ For automation, use `--yes --layout single|meta`, optionally with
 GitHub value enables sync. Meta repositories leave root sync disabled because
 individual beads route to their labelled sub-repositories.
 
+Single-repo setup also writes native Beads `github.repository`, `github.owner`
+and `github.repo`, so later `bd github` commands use the same repository outside
+the board. Credentials are never written to project configuration. The GitHub
+repository is distinct from Beads' `--repo` storage-routing option; meta-repo
+tasks continue to use `repo::` labels.
+
+Account-limit diagnostics are available with `beadsboard usage` (JSON output).
+Codex uses the [app-server account API](https://developers.openai.com/codex/app-server).
+Claude uses the OAuth usage endpoint used by Claude Code, with
+`CLAUDE_CODE_OAUTH_TOKEN`, its credentials file, or the standard macOS Keychain
+entry. That endpoint is not a public API contract and may change. Custom
+`CLAUDE_CONFIG_DIR` credentials files are supported; a custom macOS Keychain
+namespace requires the token environment variable. No tokens are printed or
+stored by Beadsboard. API-key-only accounts may not expose subscription quotas.
+
 The local config stores `pm_session` and `pm_summary`. Every later Claude planning
 launch resumes that PM session, runs `bd prime` for authoritative context, and
 updates the compact summary through `beadsboard pm summarize` rather than editing
@@ -163,6 +198,13 @@ prompt but cannot resume the Claude session.
 ```bash
 go test ./...
 go build -o beadsboard .
+```
+
+Terminal regression checks (temporary Python environment):
+
+```bash
+uv run --with pyte python tests/pty_smoke.py ./beadsboard
+uv run --with pyte python tests/pty_board.py ./beadsboard
 ```
 
 Stack: bubbletea + lipgloss + bubbles. `internal/beads` is the `bd` client, graph
