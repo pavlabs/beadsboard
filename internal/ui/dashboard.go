@@ -19,6 +19,7 @@ func (c *taskCounts) add(is beads.Issue, status string) {
 	c.total++
 	if is.Status == "closed" {
 		c.finished++
+		return
 	}
 	switch status {
 	case beads.StatusWIP:
@@ -64,33 +65,21 @@ func (m model) dashboardContent(width int) string {
 	}
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("Dashboard") + "\n\n")
-	b.WriteString(m.usageSummary(0, true) + "\n" + m.usageSummary(1, true) + "\n\n")
-	b.WriteString("Account windows are provider-reported; a daily limit may not exist.\n\n")
 	fmt.Fprintf(&b, "Tasks: %d   Finished: %s   Open: %s\n", total.total, countPercent(total.finished, total.total), countPercent(total.total-total.finished, total.total))
 	fmt.Fprintf(&b, "In progress: %d   Ready: %d   Blocked: %d\n", total.active, total.ready, total.blocked)
 	fmt.Fprintf(&b, "Closed epics: %d/%d   Need attention: %d\n\n", finishedEpics, epics, m.attentionCount())
 	if total.total == 0 {
 		b.WriteString("No tasks yet. Create tasks to see completion metrics.\n\n")
 	}
-	b.WriteString(titleStyle.Render("Tasks by priority") + "\n")
-	if width >= 100 {
-		fmt.Fprintf(&b, "%-9s %6s %15s %15s %15s %15s %15s\n", "Priority", "Total", "Finished", "Open", "In progress", "Ready", "Blocked")
+	overview := taskOverview(total, width)
+	limits := titleStyle.Render("Account limits") + "\n" + m.usageCharts(0, min(width, 48)) + "\n\n" + m.usageCharts(1, min(width, 48))
+	if width >= 110 {
+		b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, lipgloss.NewStyle().Width(width-50).Render(overview), "  ", limits))
+	} else {
+		b.WriteString(overview + "\n\n" + limits)
 	}
-	for p, c := range priorities {
-		if p == 5 && c.total == 0 {
-			continue
-		}
-		label := fmt.Sprintf("P%d", p)
-		if p == 5 {
-			label = "Other"
-		}
-		if width >= 100 {
-			fmt.Fprintf(&b, "%-9s %6d %15s %15s %15s %15s %15s\n", label, c.total, countPercent(c.finished, c.total), countPercent(c.total-c.finished, c.total), countPercent(c.active, c.total), countPercent(c.ready, c.total), countPercent(c.blocked, c.total))
-		} else {
-			fmt.Fprintf(&b, "%s: %d tasks\n  Finished %s   Open %s\n  In progress %s   Ready %s\n  Blocked %s\n", label, c.total, countPercent(c.finished, c.total), countPercent(c.total-c.finished, c.total), countPercent(c.active, c.total), countPercent(c.ready, c.total), countPercent(c.blocked, c.total))
-		}
-	}
-	b.WriteString("\nPercentages use each row's total tasks.\nOpen means unfinished; ready, in progress and blocked are subsets.\nReady means open with no unresolved blocking dependencies.\nEpics and display buckets are excluded from task counts.")
+	b.WriteString("\n\n" + priorityCharts(priorities, width))
+	b.WriteString("\nBars show completion; percentages use each priority's total.\nOpen includes active, ready, blocked and other unfinished tasks.\nAccount bars show usage; windows are provider-reported.\nEpics and display buckets are excluded from task counts.")
 	return lipgloss.NewStyle().Width(max(width, 1)).Render(b.String())
 }
 
