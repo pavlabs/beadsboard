@@ -173,7 +173,7 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":17,"wind
             # Drain a full frame after the title appears, then prove the task is open.
             text = wait_for(fd, stream, screen, "tab field")
             assert "title" in text and "Orphan approval" in text
-            send(b"v", "Tasks by priority")
+            send(b"v", "Completion")
             text = wait_for(fd, stream, screen, "Tasks: 4")
             assert "Finished: 1 (25%)" in text
             capture("dashboard-wide")
@@ -181,8 +181,10 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":17,"wind
             save()
             wait_for(fd, stream, screen, "Finished: 0 (0%)", timeout=10)
             resize(80, 24)
-            wait_for(fd, stream, screen, "P0: 1 tasks")
+            wait_for(fd, stream, screen, "Completion")
             capture("dashboard-compact")
+            send(b"\x1b[F", "P4: 0 tasks")
+            capture("dashboard-priorities-compact")
             send(b"\x1b", "tab field")
             send(b"f", "f/esc restore")
             capture("fullscreen-compact")

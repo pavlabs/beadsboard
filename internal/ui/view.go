@@ -75,7 +75,7 @@ func (m model) View() string {
 	}
 
 	if m.showUsageBar() {
-		body += "\n" + ansi.Truncate(m.usageSummary(0, false), m.width, "…") + "\n" + ansi.Truncate(m.usageSummary(1, false), m.width, "…")
+		body += "\n" + ansi.Truncate(m.usageStatusBar(0, m.width), m.width, "…") + "\n" + ansi.Truncate(m.usageStatusBar(1, m.width), m.width, "…")
 	}
 	return strings.Join([]string{ansi.Truncate(header, m.width, "…"), body, ansi.Truncate(footer, m.width, "…")}, "\n")
 }

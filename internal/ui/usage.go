@@ -7,6 +7,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/pavlabs/beadsboard/internal/usage"
 )
@@ -96,4 +97,67 @@ func (m model) usageSummary(index int, detailed bool) string {
 		out += "\n  " + s.Error
 	}
 	return out
+}
+
+func (m model) usageCharts(index, width int) string {
+	s := m.usage[index].snapshot
+	if len(s.Windows) == 0 {
+		return lipgloss.NewStyle().Width(max(width, 1)).Render(m.usageSummary(index, true))
+	}
+	stale := s.Error != "" || time.Since(s.FetchedAt) > 2*usageInterval
+	heading := []string{"Codex", "Claude"}[index]
+	if stale {
+		heading += " · STALE"
+	} else {
+		heading += " · updated " + s.FetchedAt.Local().Format("15:04:05")
+	}
+	parts := []string{titleStyle.Render(heading)}
+	for _, w := range s.Windows {
+		color := cyan
+		if w.Used >= 90 {
+			color = red
+		} else if w.Used >= 70 {
+			color = yellow
+		}
+		if stale {
+			color = grey
+		}
+		parts = append(parts, fmt.Sprintf("%s · %.0f%% used · %s", w.Name, w.Used, resetIn(w.ResetsAt, time.Now())), gauge(max(width-2, 1), w.Used/100, color))
+	}
+	if s.Error != "" {
+		parts = append(parts, s.Error)
+	}
+	return lipgloss.NewStyle().Width(max(width, 1)).Render(strings.Join(parts, "\n"))
+}
+
+func (m model) usageStatusBar(index, width int) string {
+	s := m.usage[index].snapshot
+	if len(s.Windows) == 0 {
+		return m.usageSummary(index, false)
+	}
+	stale := s.Error != "" || time.Since(s.FetchedAt) > 2*usageInterval
+	heading := []string{"Codex", "Claude"}[index]
+	if stale {
+		heading += " STALE"
+	}
+	parts := []string{heading}
+	count := min(len(s.Windows), 2)
+	barWidth := min(12, max((width-len(heading)-4)/count-23, 0))
+	for _, w := range s.Windows[:count] {
+		color := cyan
+		if w.Used >= 90 {
+			color = red
+		} else if w.Used >= 70 {
+			color = yellow
+		}
+		if stale {
+			color = grey
+		}
+		text := fmt.Sprintf("%s %.0f%% used", w.Name, w.Used)
+		if barWidth >= 3 {
+			text += " " + gauge(barWidth, w.Used/100, color)
+		}
+		parts = append(parts, text)
+	}
+	return strings.Join(parts, "  ")
 }

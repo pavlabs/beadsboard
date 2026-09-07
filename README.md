@@ -34,7 +34,8 @@ beadsboard --version
   `f` or `Esc` restores the previous list or detail view. Editing and scrolling
   work in fullscreen; narrow task panes omit the side preview.
 - **Live dashboard.** `v` opens a board-wide dashboard with task completion,
-  in-progress, ready and blocked counts, plus percentages per priority. Each row
+  a status pie, completion bars per priority, and colored account usage gauges.
+  Exact counts remain visible, with lettered slices when color is disabled. Each row
   uses that priority's total tasks; ready is a subset of open (unfinished) work.
   Epics are counted separately. `v` or `Esc` returns to the previous view.
 - **Account limits.** The dashboard and task status bar show Claude and Codex
