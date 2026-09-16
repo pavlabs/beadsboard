@@ -1267,9 +1267,34 @@ func (m model) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.taskCursor = 0
 	} else {
 		m.epicCursor = 0
+		// The epic list only ever holds epics, so a query naming a task can
+		// never match it there. Resolve by id project-wide instead, and jump
+		// straight to the task under its epic the moment one matches.
+		if id, ok := m.exactBeadMatch(m.query()); ok && !m.graph.Issues[id].IsEpic() {
+			m.clearSearch()
+			next, jumpCmd := m.jumpToBead(id)
+			return next, tea.Batch(cmd, jumpCmd)
+		}
 	}
 	m.syncDetail() // preview follows the top match live
 	return m, cmd
+}
+
+// exactBeadMatch resolves query to a bead id project-wide (epic or task) by
+// its full id or unprefixed ref (e.g. "e90.4"). It skips the bare short id
+// ("#4") fuzzyFilter also accepts, since that reads unambiguously only beside
+// its own epic — globally it can collide across epics.
+func (m model) exactBeadMatch(query string) (string, bool) {
+	query = strings.TrimSpace(query)
+	if query == "" || m.graph == nil {
+		return "", false
+	}
+	for id := range m.graph.Issues {
+		if strings.EqualFold(id, query) || strings.EqualFold(beadRef(id), query) {
+			return id, true
+		}
+	}
+	return "", false
 }
 
 // fuzzyFilter matches titles and full/displayed IDs independently. An exact ID

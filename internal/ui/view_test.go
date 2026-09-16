@@ -223,6 +223,23 @@ func TestSearchFiltersEpics(t *testing.T) {
 	require.Len(t, m.visibleEpics(), 2, "esc clears the filter")
 }
 
+// A query naming a task by id can never match the epic-only list search
+// filters, so it must resolve globally and jump straight to the task under
+// its own epic instead of coming up empty.
+func TestGlobalIDSearchJumpsToTaskUnderItsEpic(t *testing.T) {
+	m := testModel()
+	m.epicCursor = indexOf(m.visibleEpics(), "b") // start away from task a.1's epic
+
+	next, _ := m.handleKey(keyMsg("/"))
+	m = next.(model)
+	m = typeKeys(m, "a.1")
+
+	require.False(t, m.searching, "an exact task match jumps immediately, closing the search")
+	require.Equal(t, "a", m.currentEpic(), "cursor lands on the task's own epic")
+	require.True(t, m.taskOpen, "the task itself opens right away")
+	require.Equal(t, "a.1", m.currentTask())
+}
+
 // esc in the list clears a filter that was confirmed with enter.
 func TestSearchEscClearsConfirmed(t *testing.T) {
 	m := testModel()
