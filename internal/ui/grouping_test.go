@@ -66,6 +66,24 @@ func TestPriorityGroupingDisablesEpicOnlyActions(t *testing.T) {
 	require.False(t, m.pickerOpen, "subtree dispatch needs a real epic and must no-op on a bucket")
 }
 
+// The task-list status filter (A/O/C) isn't task-specific — it filters by
+// Status generically, so it must apply to epics too once they appear in a
+// priority bucket's flattened list.
+func TestPriorityGroupingStatusFilterAppliesToEpicsToo(t *testing.T) {
+	m := testModel()
+	m.graph = beads.BuildGraph(map[string]beads.Issue{
+		"a":   {ID: "a", Title: "Alpha epic", IssueType: "epic", Priority: 0, Status: "closed"},
+		"a.1": {ID: "a.1", Title: "alpha task", IssueType: "task", Priority: 0, Status: "open"},
+		"b":   {ID: "b", Title: "Beta epic", IssueType: "epic", Priority: 0, Status: "open"},
+	})
+	m = press(m, "P", "t")
+	require.Equal(t, []string{"a", "a.1", "b"}, m.visibleTasks())
+
+	require.Equal(t, []string{"a.1", "b"}, press(m, "O").visibleTasks(), "open filter drops the closed epic")
+	require.Equal(t, []string{"a"}, press(m, "C").visibleTasks(), "closed filter keeps only the closed epic")
+	require.Equal(t, []string{"a", "a.1", "b"}, press(press(m, "C"), "A").visibleTasks(), "A restores the unfiltered list")
+}
+
 func TestPriorityGroupingSurfacesEpicsInTheFlatList(t *testing.T) {
 	m := priorityGroupModel()
 	m = press(m, "P")
