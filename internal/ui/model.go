@@ -42,6 +42,7 @@ type model struct {
 
 	epicCursor int
 	wrap       bool // wrap epic titles in the list instead of truncating
+	groupMode  int  // groupByEpic | groupByPriority; left-pane grouping
 
 	searching   bool            // the search input is capturing keys
 	searchScope int             // which list the query filters (scope* below)
@@ -141,6 +142,13 @@ const (
 	tasksAll = iota
 	tasksOpen
 	tasksClosed
+)
+
+// Left-pane grouping modes: the default epic hierarchy, or a flat view
+// grouping every epic and task by priority level.
+const (
+	groupByEpic = iota
+	groupByPriority
 )
 
 // Right-pane sections the cursor cycles through with tab.
@@ -431,7 +439,7 @@ func (m model) focusTasks() (tea.Model, tea.Cmd) {
 	if m.taskOpen || m.graph == nil {
 		return m, nil // a task has no task list of its own
 	}
-	if m.currentEpic() == "" {
+	if m.currentGroup() == "" {
 		return m, nil
 	}
 	m.focused = true
@@ -456,13 +464,13 @@ func (m model) adopt(graph *beads.Graph, rev uint64) (tea.Model, tea.Cmd) {
 	// Diff against what was on screen before adopting, so only the beads that
 	// actually moved get pushed.
 	changed := beads.ChangedForSync(m.graph, graph)
-	selectedEpic, selectedTask := m.currentEpic(), m.currentTask()
+	selectedGroup, selectedTask := m.currentGroup(), m.currentTask()
 
 	m.err = nil
 	m.graph = graph
 	m.rev = rev
 	m.loadGen++
-	if i := indexOf(m.visibleEpics(), selectedEpic); i >= 0 {
+	if i := indexOf(m.visibleEpics(), selectedGroup); i >= 0 {
 		m.epicCursor = i
 	}
 	if i := indexOf(m.visibleTasks(), selectedTask); i >= 0 {
@@ -976,16 +984,35 @@ func (m model) handleLeftKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.notice = "pulling status from GitHub…"
 			return m, m.pullStatusesCmd()
 		}
+	case "O":
+		m.setGroupMode(groupByEpic)
+	case "P":
+		m.setGroupMode(groupByPriority)
 	case "enter", "l", "right":
-		if m.currentEpic() != "" {
+		if m.currentGroup() != "" {
 			m.clearSearch()
 			m.focused = true
 			m.section = secTitle
+			if m.groupMode == groupByPriority {
+				m.section = secTasks // a bucket has no fields of its own to land on
+			}
 			m.taskCursor = 0
 			m.syncDetail()
 		}
 	}
 	return m, nil
+}
+
+// setGroupMode switches the left pane's grouping and re-anchors both cursors,
+// since a bucket list and an epic list share no positions worth preserving.
+func (m *model) setGroupMode(mode int) {
+	if m.groupMode == mode {
+		return
+	}
+	m.groupMode = mode
+	m.epicCursor = 0
+	m.taskCursor = 0
+	m.syncDetail()
 }
 
 // handleRightKey drives the fields + task-list sections of the right pane.
@@ -1041,7 +1068,11 @@ func (m model) handleRightKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "a":
 		if m.section == secTasks {
 			if id := m.currentTask(); id != "" {
-				m.openPicker(id, "task")
+				scope := "task"
+				if m.graph.Issues[id].IsEpic() {
+					scope = "epic" // the flat priority view can surface an epic here
+				}
+				m.openPicker(id, scope)
 			}
 		}
 	case "d":
@@ -1051,8 +1082,9 @@ func (m model) handleRightKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case "n":
-		if !m.loading && m.section == secTasks {
-			m.beginCreate("task", m.currentEpic())
+		// A new task needs a real parent epic, which a priority bucket isn't.
+		if id := m.currentEpic(); !m.loading && m.section == secTasks && id != "" {
+			m.beginCreate("task", id)
 		}
 	case "enter", "l", "right":
 		if m.section == secTasks && m.currentTask() != "" {
@@ -1468,17 +1500,28 @@ func (m *model) clampCursors() {
 	m.taskCursor = min(max(m.taskCursor, 0), max(len(m.visibleTasks())-1, 0))
 }
 
-// currentEpic is the epic the cursor is highlighting, or "".
-func (m model) currentEpic() string {
-	epics := m.visibleEpics()
-	if m.epicCursor < 0 || m.epicCursor >= len(epics) {
+// currentGroup is whatever the left-pane cursor highlights: a real epic id in
+// groupByEpic, or a priority-bucket id in groupByPriority.
+func (m model) currentGroup() string {
+	groups := m.visibleEpics()
+	if m.epicCursor < 0 || m.epicCursor >= len(groups) {
 		return ""
 	}
-	return epics[m.epicCursor]
+	return groups[m.epicCursor]
 }
 
-// currentTask is the task the cursor is highlighting within the current epic, or
-// "".
+// currentEpic is the real epic the cursor is highlighting, or "" — including
+// whenever grouping is by priority, since a bucket names no single epic and
+// every epic-only action (launch, delete, subtree dispatch) must no-op there.
+func (m model) currentEpic() string {
+	if m.groupMode != groupByEpic {
+		return ""
+	}
+	return m.currentGroup()
+}
+
+// currentTask is the task the cursor is highlighting within the current
+// group, or "".
 func (m model) currentTask() string {
 	tasks := m.visibleTasks()
 	if m.taskCursor < 0 || m.taskCursor >= len(tasks) {
@@ -1487,10 +1530,15 @@ func (m model) currentTask() string {
 	return tasks[m.taskCursor]
 }
 
-// visibleEpics is the epic list after applying an active epic-scoped filter.
+// visibleEpics is the left pane's group list: real epics after an active
+// epic-scoped filter in groupByEpic, or the non-empty priority buckets in
+// groupByPriority.
 func (m model) visibleEpics() []string {
 	if m.graph == nil {
 		return nil
+	}
+	if m.groupMode == groupByPriority {
+		return m.priorityGroups()
 	}
 	if m.searchScope == scopeEpics && m.query() != "" {
 		return fuzzyFilter(m.graph.Epics, m.query(), func(id string) string {
@@ -1498,6 +1546,58 @@ func (m model) visibleEpics() []string {
 		})
 	}
 	return m.graph.Epics
+}
+
+// priorityGroupPrefix marks a left-pane row as a synthetic priority bucket
+// rather than a real bead id, the same way beads.orphanEpicID's '~' does.
+const priorityGroupPrefix = "prio:"
+
+// priorityLevels is bd's priority range (0 = most urgent, 4 = least).
+const priorityLevels = 5
+
+func priorityGroupID(p int) string { return fmt.Sprintf("%s%d", priorityGroupPrefix, p) }
+
+// priorityGroupLevel parses a bucket id back to its priority level.
+func priorityGroupLevel(id string) (int, bool) {
+	rest, ok := strings.CutPrefix(id, priorityGroupPrefix)
+	if !ok {
+		return 0, false
+	}
+	p, err := strconv.Atoi(rest)
+	return p, err == nil
+}
+
+// priorityGroups lists the non-empty priority buckets, most urgent first.
+func (m model) priorityGroups() []string {
+	var groups []string
+	for p := range priorityLevels {
+		if len(m.priorityGroupItems(priorityGroupID(p))) > 0 {
+			groups = append(groups, priorityGroupID(p))
+		}
+	}
+	return groups
+}
+
+// priorityGroupItems flattens every epic and task at one priority level into
+// one list, epics included — the graph's existing epic/topo order is kept
+// rather than inventing a new sort for a purely cosmetic regrouping.
+func (m model) priorityGroupItems(groupID string) []string {
+	p, ok := priorityGroupLevel(groupID)
+	if !ok {
+		return nil
+	}
+	var items []string
+	for _, epicID := range m.graph.Epics {
+		if m.graph.Issues[epicID].Priority == p {
+			items = append(items, epicID)
+		}
+		for _, taskID := range m.graph.Tasks[epicID] {
+			if m.graph.Issues[taskID].Priority == p {
+				items = append(items, taskID)
+			}
+		}
+	}
+	return items
 }
 
 // visibleTasks is the current epic's task list after applying an active
@@ -1554,11 +1654,15 @@ func (m model) target() string {
 	return m.currentEpic()
 }
 
-// currentEpicTasks are the tasks of the highlighted epic, in topo order.
+// currentEpicTasks are the items under the highlighted group: an epic's
+// tasks in topo order, or every epic and task at the highlighted priority.
 func (m model) currentEpicTasks() []string {
-	e := m.currentEpic()
-	if e == "" {
+	group := m.currentGroup()
+	if group == "" {
 		return nil
 	}
-	return m.graph.Tasks[e]
+	if m.groupMode == groupByPriority {
+		return m.priorityGroupItems(group)
+	}
+	return m.graph.Tasks[group]
 }

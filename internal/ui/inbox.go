@@ -90,6 +90,9 @@ func (m model) jumpToBead(bead string) (tea.Model, tea.Cmd) {
 		m.notice = "Bead no longer exists: " + bead
 		return m, nil
 	}
+	// A jump names a specific bead, not a priority level, so it always lands in
+	// the epic hierarchy regardless of the left pane's current grouping.
+	m.groupMode = groupByEpic
 	epic := bead
 	if !m.graph.Issues[bead].IsEpic() {
 		epic = m.graph.EpicOf(bead)

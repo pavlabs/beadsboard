@@ -172,7 +172,7 @@ func (m model) footerLine() string {
 	case m.focused:
 		keys = "tab section · D auto-run · t tasks · e edit · c copy · o issue · esc back · q quit"
 	default:
-		keys = "v dashboard · t tasks · ↑/↓ move · → open · D auto-run · n new · c copy · o issue · / search · i inbox · A agents · r refresh · q quit"
+		keys = "v dashboard · t tasks · ↑/↓ move · → open · O epics · P priority · D auto-run · n new · c copy · o issue · / search · i inbox · A agents · r refresh · q quit"
 		if m.cfg.GitHubSync {
 			keys += " · G github-pull"
 		}
@@ -255,6 +255,9 @@ func (m model) taskPreviewContent(width, height int) string {
 func (m model) epicsContent(width, height int) string {
 	epics := m.visibleEpics()
 	if len(epics) == 0 {
+		if m.groupMode == groupByPriority {
+			return dimStyle.Render("no beads")
+		}
 		if m.searchScope == scopeEpics && m.query() != "" {
 			return dimStyle.Render("no match")
 		}
@@ -267,7 +270,11 @@ func (m model) epicsContent(width, height int) string {
 		blocks[i] = m.renderEpicBlock(id, i == m.epicCursor, width)
 	}
 
-	title := fmt.Sprintf("EPICS (%d)", len(epics))
+	label := "EPICS"
+	if m.groupMode == groupByPriority {
+		label = "PRIORITY"
+	}
+	title := fmt.Sprintf("%s (%d)", label, len(epics))
 	if m.wrap {
 		title += "  ⏎ wrapped"
 	}
@@ -281,13 +288,29 @@ func (m model) epicsContent(width, height int) string {
 	return b.String()
 }
 
-// renderEpicBlock renders one epic as the lines it occupies: a single truncated
-// row normally, or a wrapped multi-line block when wrap is on.
+// renderEpicBlock renders one left-pane row: a priority bucket's one-line
+// summary, or an epic as a single truncated row (multiple only when wrap is
+// on).
 func (m model) renderEpicBlock(id string, selected bool, width int) []string {
+	if m.groupMode == groupByPriority {
+		return []string{m.renderPriorityGroupRow(id, selected, width)}
+	}
 	if !m.wrap {
 		return []string{m.renderRow(id, selected, width)}
 	}
 	return m.renderWrappedRow(id, selected, width)
+}
+
+// renderPriorityGroupRow renders one priority bucket: its level and how many
+// epics and tasks it holds. A bucket is synthetic, not a real bead, so it
+// skips the status glyph and prereq annotation renderRow would add.
+func (m model) renderPriorityGroupRow(id string, selected bool, width int) string {
+	p, _ := priorityGroupLevel(id)
+	label := fmt.Sprintf("P%d  %d bead(s)", p, len(m.priorityGroupItems(id)))
+	if selected {
+		return selectedStyle.Width(width).Render(truncate(label, width))
+	}
+	return truncate(label, width)
 }
 
 // renderWrappedRow lays an epic out over as many lines as its title needs: the
@@ -345,7 +368,11 @@ func (m model) taskListContent(width, height int) string {
 	filtered := m.searchScope == scopeTasks && m.query() != ""
 
 	var b strings.Builder
-	hdr := fmt.Sprintf("TASKS (%d) %s", len(tasks), m.taskFilterName())
+	label := "TASKS"
+	if m.groupMode == groupByPriority {
+		label = "ITEMS" // the flat priority view mixes epics and tasks
+	}
+	hdr := fmt.Sprintf("%s (%d) %s", label, len(tasks), m.taskFilterName())
 	if filtered {
 		hdr += " /" + m.query()
 	}
